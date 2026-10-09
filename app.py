@@ -1,2066 +1,366 @@
-
-import os
+# ============================================================
+# CAPSICUM PLANT CONDITION DETECTION API
+# ResNet50 | Layer4 + FC fine-tuning | 13 classes
+# Compatible with train_augu.py: Dropout(0.30) + Linear(2048, 13)
+# ============================================================
 import io
-from typing import List
+import os
+from contextlib import asynccontextmanager
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
-
 from PIL import Image, UnidentifiedImageError
-
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException
-)
-
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
-from torchvision import models
-from torchvision import transforms
-
+from torchvision import models, transforms
 from class_info import CLASS_INFO
 
-
-# ============================================================
-# BASE DIRECTORY
-# ============================================================
-
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-
-# ============================================================
-# MODEL PATH
-# ============================================================
-
-MODEL_PATH = os.environ.get("MODEL_PATH", "")
-if not MODEL_PATH or not os.path.exists(MODEL_PATH):
-    default_path = os.path.join(BASE_DIR, "models", "condition_resnet50.pth")
-    best_path = os.path.join(BASE_DIR, "models", "condition_resnet50_best.pth")
-    if os.path.exists(default_path):
-        MODEL_PATH = default_path
-    elif os.path.exists(best_path):
-        MODEL_PATH = best_path
-    else:
-        MODEL_PATH = default_path
-
-
-# ============================================================
-# DATASET PATHS
-#
-# IMPORTANT:
-#
-# train:
-#     augmented_dataset/train
-#
-# validation:
-#     dataset_split/valid
-#
-# test:
-#     dataset_split/test
-#
-# Only TRAIN was augmented.
-# Validation and TEST remain untouched.
-# ============================================================
-
-TRAIN_DIR = os.path.join(
-    BASE_DIR,
-    "augmented_dataset",
-    "train"
-)
-
-VALID_DIR = os.path.join(
-    BASE_DIR,
-    "dataset_split",
-    "valid"
-)
-
-TEST_DIR = os.path.join(
-    BASE_DIR,
-    "dataset_split",
-    "test"
-)
-
-
-# ============================================================
-# MODEL CONFIGURATION
-#
-# Matches train_augu.py
-# ============================================================
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_SIZE = 224
-
-NUM_CLASSES = 12
-
+TRAIN_TARGET = 1100
+NUM_CLASSES = 13
+EXPECTED_TRAIN_TOTAL = TRAIN_TARGET * NUM_CLASSES
 TOP_K = 5
-
 DROPOUT = 0.30
-
-
-# ============================================================
-# EXPECTED CLASS ORDER
-#
-# This must exactly match train_augu.py
-# ============================================================
+MAX_UPLOAD_MB = 15
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 EXPECTED_CLASSES = [
-
-    "Anthracnose",
-
-    "Larva",
-
-    "Magnesium",
-
-    "bacterial spot",
-
-    "blossom-end rot",
-
-    "down leaf aphid",
-
-    "fruit thrips",
-
-    "healthy",
-
-    "powdery mildew",
-
-    "snail",
-
-    "upperleaf thrips",
-
-    "virus"
-
+    "Anthracnose", "Larva", "Magnesium", "Phytophthora blight",
+    "bacterial spot", "blossom-end rot", "down leaf aphid", "fruit thrips",
+    "healthy", "powdery mildew", "snail", "upperleaf thrips", "virus",
 ]
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff"}
+TRAIN_DIR = os.path.join(BASE_DIR, "augmented_dataset", "train")
+VALID_DIR = os.path.join(BASE_DIR, "augmented_dataset", "valid")
+TEST_DIR = os.path.join(BASE_DIR, "augmented_dataset", "test")
 
 
-# ============================================================
-# DEVICE
-# ============================================================
+def resolve_model_path():
+    env_path = os.environ.get("MODEL_PATH", "").strip()
+    if env_path:
+        return os.path.abspath(env_path)
+    candidates = [
+        os.path.join(BASE_DIR, "models", "condition_resnet50_best.pth"),
+        os.path.join(BASE_DIR, "models", "condition_resnet50.pth"),
+        os.path.join(BASE_DIR, "condition_resnet50_best.pth"),
+        os.path.join(BASE_DIR, "condition_resnet50.pth"),
+    ]
+    return next((p for p in candidates if os.path.isfile(p)), candidates[0])
 
-DEVICE = torch.device(
-
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
-
-)
-
-
-# ============================================================
-# FASTAPI APPLICATION
-# ============================================================
-
-app = FastAPI(
-
-    title="Capsicum Plant Condition Detection API",
-
-    description="""
-
-ResNet50 based Capsicum Plant Condition Detection API.
-
-Model:
-    ResNet50
-
-Classes:
-    12
-
-Input:
-    Capsicum plant / leaf image
-
-Output:
-    Predicted condition
-    Confidence
-    Top-5 predictions
-    Class information
-
-Training pipeline:
-
-    data new
-        ↓
-    duplicate-safe split
-        ↓
-    dataset_split
-        ├── train
-        ├── valid
-        └── test
-        ↓
-    train-only offline augmentation
-        ↓
-    augmented_dataset/train
-        ↓
-    ResNet50 training
-
-Validation and test images are NOT augmented.
-
-This API contains only the CNN model.
-Soil and crop prediction modules are not included.
-
-""",
-
-    version="4.0.0"
-
-)
-
-
-# ============================================================
-# CORS
-# ============================================================
-
-app.add_middleware(
-
-    CORSMiddleware,
-
-    allow_origins=["*"],
-
-    allow_credentials=False,
-
-    allow_methods=["*"],
-
-    allow_headers=["*"]
-
-)
-
-
-# ============================================================
-# INFERENCE TRANSFORM
-#
-# IMPORTANT:
-# No random augmentation during prediction.
-#
-# train_augu.py:
-#     Resize -> Tensor -> Normalize
-#
-# API:
-#     Same deterministic preprocessing
-# ============================================================
-
+MODEL_PATH = resolve_model_path()
 INFERENCE_TRANSFORM = transforms.Compose([
-
-    transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
-    ),
-
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor(),
-
-    transforms.Normalize(
-
-        mean=[
-            0.485,
-            0.456,
-            0.406
-        ],
-
-        std=[
-            0.229,
-            0.224,
-            0.225
-        ]
-
-    )
-
+    transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
 ])
-
-
-# ============================================================
-# GLOBAL VARIABLES
-# ============================================================
-
-model = None
-
-MODEL_CLASSES = []
-
-MODEL_ARCHITECTURE = "Unknown"
-
+model: Optional[nn.Module] = None
+MODEL_CLASSES: List[str] = []
+MODEL_ARCHITECTURE = "ResNet50 + Layer4 Fine-Tuning + Dropout(0.30) + Linear(2048,13)"
 CHECKPOINT_INFO = {}
 
 
-# ============================================================
-# SUPPORTED IMAGE EXTENSIONS
-# ============================================================
-
-IMAGE_EXTENSIONS = (
-
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".bmp",
-    ".tif",
-    ".tiff"
-
-)
-
-
-# ============================================================
-# COUNT IMAGES
-# ============================================================
-
-def count_images(directory: str):
-
-    if not os.path.isdir(directory):
-
-        return 0
-
-    total = 0
-
-    for root, _, files in os.walk(directory):
-
-        for filename in files:
-
-            if filename.lower().endswith(
-                IMAGE_EXTENSIONS
-            ):
-
-                total += 1
-
-    return total
-
-
-# ============================================================
-# COUNT IMAGES PER CLASS
-# ============================================================
-
-def count_images_per_class(directory: str):
-
-    result = {}
-
-    for class_name in EXPECTED_CLASSES:
-
-        class_dir = os.path.join(
-
-            directory,
-
-            class_name
-
-        )
-
-        result[class_name] = count_images(
-            class_dir
-        )
-
-    return result
-
-
-# ============================================================
-# EXTRACT STATE DICT
-# ============================================================
-
 def extract_state_dict(checkpoint):
-
-    if not isinstance(
-        checkpoint,
-        dict
-    ):
-
+    if not isinstance(checkpoint, dict):
         return checkpoint
-
-    if "model_state_dict" in checkpoint:
-
-        return checkpoint[
-            "model_state_dict"
-        ]
-
-    if "state_dict" in checkpoint:
-
-        return checkpoint[
-            "state_dict"
-        ]
-
+    for key in ("model_state_dict", "state_dict"):
+        if isinstance(checkpoint.get(key), dict):
+            return checkpoint[key]
     return checkpoint
 
 
-# ============================================================
-# CLEAN STATE DICT
-# ============================================================
-
 def clean_state_dict(state_dict):
-
-    cleaned = {}
-
-    for key, value in state_dict.items():
-
-        if key.startswith("module."):
-
-            key = key[
-                len("module.") :
-            ]
-
-        cleaned[key] = value
-
-    return cleaned
+    return {(k[7:] if k.startswith("module.") else k): v for k, v in state_dict.items()}
 
 
-# ============================================================
-# GET MODEL CLASSES
-# ============================================================
-
-def get_model_classes(checkpoint):
-
-    if isinstance(
-        checkpoint,
-        dict
-    ):
-
-        # ----------------------------------------------------
-        # Preferred: classes saved inside checkpoint
-        # ----------------------------------------------------
-
-        if "classes" in checkpoint:
-
-            return list(
-                checkpoint["classes"]
-            )
-
-        # ----------------------------------------------------
-        # class_to_idx
-        # ----------------------------------------------------
-
-        if "class_to_idx" in checkpoint:
-
-            mapping = checkpoint[
-                "class_to_idx"
-            ]
-
-            return [
-
-                class_name
-
-                for class_name, index
-
-                in sorted(
-
-                    mapping.items(),
-
-                    key=lambda x: x[1]
-
-                )
-
-            ]
-
-    # --------------------------------------------------------
-    # Current train_augu.py class order
-    # --------------------------------------------------------
-
+def get_checkpoint_classes(checkpoint):
+    if isinstance(checkpoint, dict):
+        classes = checkpoint.get("classes")
+        if isinstance(classes, (list, tuple)):
+            return list(classes)
+        mapping = checkpoint.get("class_to_idx")
+        if isinstance(mapping, dict):
+            try:
+                return [name for name, _ in sorted(mapping.items(), key=lambda item: int(item[1]))]
+            except (TypeError, ValueError):
+                raise RuntimeError("Checkpoint class_to_idx mapping is invalid.")
     return EXPECTED_CLASSES.copy()
 
 
-# ============================================================
-# VALIDATE CLASSES
-# ============================================================
-
-def validate_classes(classes):
-
-    # --------------------------------------------------------
-    # Number of classes
-    # --------------------------------------------------------
-
+def validate_class_order(classes):
     if len(classes) != NUM_CLASSES:
-
-        raise RuntimeError(
-
-            f"Model has {len(classes)} classes. "
-
-            f"Expected {NUM_CLASSES}."
-
-        )
-
-    # --------------------------------------------------------
-    # Exact order
-    #
-    # IMPORTANT:
-    # Class order must match model output indices.
-    # --------------------------------------------------------
-
+        raise RuntimeError(f"Checkpoint contains {len(classes)} classes; expected {NUM_CLASSES}.")
     if classes != EXPECTED_CLASSES:
-
         raise RuntimeError(
-
-            "CRITICAL: Model class order does not "
-            "match train_augu.py.\n\n"
-
-            f"Expected order:\n"
-            f"{EXPECTED_CLASSES}\n\n"
-
-            f"Model order:\n"
-            f"{classes}"
-
+            "Checkpoint class order does not match app.py.\n"
+            f"Expected: {EXPECTED_CLASSES}\nCheckpoint: {classes}"
         )
 
-
-# ============================================================
-# PRINT FC LAYERS
-# ============================================================
-
-def print_fc_layers(state_dict):
-
-    print()
-
-    print(
-        "-" * 70
-    )
-
-    print(
-        "CHECKPOINT FC LAYERS"
-    )
-
-    print(
-        "-" * 70
-    )
-
-    found = False
-
-    for key, value in state_dict.items():
-
-        if key.startswith("fc."):
-
-            found = True
-
-            if hasattr(
-                value,
-                "shape"
-            ):
-
-                print(
-
-                    f"{key:<20}"
-                    f"{tuple(value.shape)}"
-
-                )
-
-            else:
-
-                print(
-                    f"{key:<20}"
-                )
-
-    if not found:
-
-        print(
-            "No FC layers found."
-        )
-
-    print(
-        "-" * 70
-    )
-
-
-# ============================================================
-# BUILD RESNET50
-#
-# EXACT ARCHITECTURE FROM train_augu.py:
-#
-# ResNet50
-#     ↓
-# Layer4 trainable
-#     ↓
-# FC
-#     Dropout(0.30)
-#     Linear(2048, 12)
-#
-# During inference dropout is automatically disabled
-# because model.eval() is used.
-# ============================================================
 
 def build_model(state_dict):
-
-    global MODEL_ARCHITECTURE
-
-    # --------------------------------------------------------
-    # Base ResNet50
-    # --------------------------------------------------------
-
-    network = models.resnet50(
-        weights=None
-    )
-
-    num_features = (
-        network.fc.in_features
-    )
-
-    # --------------------------------------------------------
-    # Expected current architecture
-    #
-    # fc.0 = Dropout
-    # fc.1 = Linear
-    # --------------------------------------------------------
-
-    if (
-        "fc.1.weight" not in state_dict
-        or
-        "fc.1.bias" not in state_dict
-    ):
-
-        print_fc_layers(
-            state_dict
-        )
-
+    network = models.resnet50(weights=None)
+    if network.fc.in_features != 2048:
+        raise RuntimeError(f"Unexpected ResNet50 FC input: {network.fc.in_features}")
+    if "fc.1.weight" not in state_dict or "fc.1.bias" not in state_dict:
+        keys = [key for key in state_dict if key.startswith("fc.")]
         raise RuntimeError(
-
-            "Checkpoint does not match "
-            "the current train_augu.py "
-            "architecture.\n\n"
-
-            "Expected classifier:\n"
-
-            "Dropout(0.30) + "
-            "Linear(2048,12)"
-
+            "Checkpoint architecture mismatch: expected Dropout + Linear with fc.1 weights. "
+            f"Found FC keys: {keys}"
         )
-
-    # --------------------------------------------------------
-    # FC weight
-    # --------------------------------------------------------
-
-    fc_weight = state_dict[
-        "fc.1.weight"
-    ]
-
-    fc_bias = state_dict[
-        "fc.1.bias"
-    ]
-
-    fc_in = fc_weight.shape[1]
-
-    fc_out = fc_weight.shape[0]
-
-    # --------------------------------------------------------
-    # Validate input features
-    # --------------------------------------------------------
-
-    if fc_in != num_features:
-
-        raise RuntimeError(
-
-            "FC input mismatch.\n"
-
-            f"Expected: {num_features}\n"
-
-            f"Found: {fc_in}"
-
-        )
-
-    # --------------------------------------------------------
-    # Validate output classes
-    # --------------------------------------------------------
-
-    if fc_out != NUM_CLASSES:
-
-        raise RuntimeError(
-
-            "FC output mismatch.\n"
-
-            f"Expected: {NUM_CLASSES}\n"
-
-            f"Found: {fc_out}"
-
-        )
-
-    # --------------------------------------------------------
-    # Validate bias
-    # --------------------------------------------------------
-
-    if fc_bias.shape[0] != NUM_CLASSES:
-
-        raise RuntimeError(
-
-            "FC bias dimension mismatch.\n"
-
-            f"Expected: {NUM_CLASSES}\n"
-
-            f"Found: {fc_bias.shape[0]}"
-
-        )
-
-    # --------------------------------------------------------
-    # EXACT classifier
-    # --------------------------------------------------------
-
-    network.fc = nn.Sequential(
-
-        nn.Dropout(
-            p=DROPOUT
-        ),
-
-        nn.Linear(
-
-            fc_in,
-
-            fc_out
-
-        )
-
-    )
-
-    MODEL_ARCHITECTURE = (
-
-        "ResNet50 + "
-        "Dropout(0.30) + "
-        "Linear(2048,12)"
-
-    )
-
-    # --------------------------------------------------------
-    # Load weights
-    # --------------------------------------------------------
-
-    try:
-
-        network.load_state_dict(
-
-            state_dict,
-
-            strict=True
-
-        )
-
-    except RuntimeError as error:
-
-        raise RuntimeError(
-
-            "Model architecture does not "
-            "match the checkpoint.\n\n"
-
-            f"{error}"
-
-        )
-
-    # --------------------------------------------------------
-    # Device
-    # --------------------------------------------------------
-
-    network = network.to(
-        DEVICE
-    )
-
-    # --------------------------------------------------------
-    # Evaluation mode
-    # --------------------------------------------------------
-
-    network.eval()
-
+    if tuple(state_dict["fc.1.weight"].shape) != (NUM_CLASSES, 2048):
+        raise RuntimeError(f"Unexpected FC weight shape: {tuple(state_dict['fc.1.weight'].shape)}")
+    if tuple(state_dict["fc.1.bias"].shape) != (NUM_CLASSES,):
+        raise RuntimeError(f"Unexpected FC bias shape: {tuple(state_dict['fc.1.bias'].shape)}")
+    network.fc = nn.Sequential(nn.Dropout(p=DROPOUT), nn.Linear(2048, NUM_CLASSES))
+    network.load_state_dict(state_dict, strict=True)
+    network.to(DEVICE).eval()
     return network
 
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
 def load_model():
-
-    global model
-
-    global MODEL_CLASSES
-
-    global CHECKPOINT_INFO
-
-    print()
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        "LOADING RESNET50 MODEL"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    # --------------------------------------------------------
-    # Model file check
-    # --------------------------------------------------------
-
-    if not os.path.isfile(
-        MODEL_PATH
-    ):
-
+    global model, MODEL_CLASSES, CHECKPOINT_INFO
+    print("\n" + "=" * 70)
+    print("LOADING CAPSICUM RESNET50 CHECKPOINT")
+    print(f"Model path: {MODEL_PATH}\nDevice: {DEVICE}")
+    if not os.path.isfile(MODEL_PATH):
         raise FileNotFoundError(
-
-            "Model file not found:\n"
-
-            + MODEL_PATH
-
+            f"Model checkpoint not found: {MODEL_PATH}\n"
+            "Place condition_resnet50_best.pth or condition_resnet50.pth in the models folder."
         )
-
-    # --------------------------------------------------------
-    # Load checkpoint
-    # --------------------------------------------------------
-
     try:
-
-        checkpoint = torch.load(
-
-            MODEL_PATH,
-
-            map_location=DEVICE,
-
-            weights_only=False
-
-        )
-
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     except TypeError:
-
-        checkpoint = torch.load(
-
-            MODEL_PATH,
-
-            map_location=DEVICE
-
-        )
-
-    # --------------------------------------------------------
-    # Save checkpoint information
-    # --------------------------------------------------------
-
-    if isinstance(
-        checkpoint,
-        dict
-    ):
-
-        CHECKPOINT_INFO = checkpoint
-
-    else:
-
-        CHECKPOINT_INFO = {}
-
-    # --------------------------------------------------------
-    # Extract state dict
-    # --------------------------------------------------------
-
-    state_dict = extract_state_dict(
-        checkpoint
-    )
-
-    state_dict = clean_state_dict(
-        state_dict
-    )
-
-    # --------------------------------------------------------
-    # Classes
-    # --------------------------------------------------------
-
-    MODEL_CLASSES = get_model_classes(
-        checkpoint
-    )
-
-    validate_classes(
-        MODEL_CLASSES
-    )
-
-    # --------------------------------------------------------
-    # FC information
-    # --------------------------------------------------------
-
-    print_fc_layers(
-        state_dict
-    )
-
-    # --------------------------------------------------------
-    # Build model
-    # --------------------------------------------------------
-
-    model = build_model(
-        state_dict
-    )
-
-    # --------------------------------------------------------
-    # Success information
-    # --------------------------------------------------------
-
-    print()
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        "CNN MODEL LOADED SUCCESSFULLY"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        f"Model            : ResNet50"
-    )
-
-    print(
-        f"Architecture     : "
-        f"{MODEL_ARCHITECTURE}"
-    )
-
-    print(
-        f"Classes          : "
-        f"{len(MODEL_CLASSES)}"
-    )
-
-    print(
-        f"Class order      : "
-        f"{MODEL_CLASSES}"
-    )
-
-    print(
-        f"Input size       : "
-        f"{IMAGE_SIZE}x{IMAGE_SIZE}"
-    )
-
-    print(
-        f"Device           : "
-        f"{DEVICE}"
-    )
-
-    print(
-        f"Model path       : "
-        f"{MODEL_PATH}"
-    )
-
-    print(
-        "=" * 80
-    )
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    CHECKPOINT_INFO = checkpoint if isinstance(checkpoint, dict) else {}
+    state_dict = clean_state_dict(extract_state_dict(checkpoint))
+    MODEL_CLASSES = get_checkpoint_classes(checkpoint)
+    validate_class_order(MODEL_CLASSES)
+    model = build_model(state_dict)
+    print("Model loaded successfully:", MODEL_ARCHITECTURE)
+    print("=" * 70)
 
 
-# ============================================================
-# STARTUP
-# ============================================================
-
-@app.on_event(
-    "startup"
-)
-def startup():
-
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     load_model()
+    yield
+    global model
+    model = None
+
+app = FastAPI(
+    title="Capsicum Plant Condition Detection API",
+    description=(
+        "ResNet50 API for 13 Capsicum conditions. Returns predicted class, "
+        "softmax confidence estimate, Top-5 alternatives and class information. "
+        "Preprocessing: Resize 224x224, ToTensor, ImageNet normalization."
+    ),
+    version="7.0.0",
+    lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
 
-# ============================================================
-# ROOT API
-# ============================================================
+def count_images(directory: str) -> int:
+    if not os.path.isdir(directory):
+        return 0
+    return sum(1 for _, _, files in os.walk(directory)
+               for name in files if name.lower().endswith(IMAGE_EXTENSIONS))
+
+
+def count_images_per_class(directory: str):
+    return {name: count_images(os.path.join(directory, name)) for name in EXPECTED_CLASSES}
+
+
+def safe_class_info(class_name: str):
+    if class_name in CLASS_INFO:
+        return CLASS_INFO[class_name]
+    target = class_name.strip().casefold()
+    for key, value in CLASS_INFO.items():
+        if key.strip().casefold() == target:
+            return value
+    return {"information_available": False,
+            "message": "No information configured for this class in class_info.py."}
+
+
+def predict_image(image: Image.Image):
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model is not loaded.")
+    tensor = INFERENCE_TRANSFORM(image.convert("RGB")).unsqueeze(0).to(DEVICE)
+    with torch.inference_mode():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+        top_probs, top_indices = torch.topk(probs, k=min(TOP_K, len(MODEL_CLASSES)))
+    predictions = []
+    for rank, (prob, idx) in enumerate(zip(top_probs.tolist(), top_indices.tolist()), 1):
+        name = MODEL_CLASSES[idx]
+        predictions.append({
+            "rank": rank, "class": name, "class_index": idx,
+            "confidence_percent": round(prob * 100.0, 4),
+            "class_information": safe_class_info(name),
+        })
+    primary = predictions[0]
+    confidence = primary["confidence_percent"]
+    level = "HIGH" if confidence >= 90 else "MEDIUM" if confidence >= 70 else "LOW" if confidence >= 50 else "VERY LOW"
+    warning = None if confidence >= 50 else (
+        "Low model confidence. Check image clarity/lighting; the image may be outside "
+        "the supported classes."
+    )
+    return {
+        "predicted_class": primary["class"],
+        "class_index": primary["class_index"],
+        "confidence_percent": confidence,
+        "confidence_level": level,
+        "confidence_note": "Softmax confidence is a model estimate, not a guarantee of correctness.",
+        "warning": warning,
+        "class_information": primary["class_information"],
+        "top_5_predictions": predictions,
+    }
+
+
+async def read_uploaded_image(file: UploadFile) -> Image.Image:
+    if file.content_type and file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(status_code=400, detail="Upload JPG, JPEG, PNG, WEBP, BMP or TIFF.")
+    contents = await file.read(MAX_UPLOAD_MB * 1024 * 1024 + 1)
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"Image exceeds {MAX_UPLOAD_MB} MB limit.")
+    try:
+        with Image.open(io.BytesIO(contents)) as source:
+            source.load()
+            return source.convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.")
+
 
 @app.get("/")
 def root():
-
     return {
-
-        "status":
-            "running",
-
-        "application":
-            "Capsicum Plant Condition Detection API",
-
-        "model":
-            "ResNet50",
-
-        "architecture":
-            MODEL_ARCHITECTURE,
-
-        "num_classes":
-            NUM_CLASSES,
-
-        "classes":
-            MODEL_CLASSES,
-
-        "input_size":
-            "224x224",
-
-        "device":
-            str(DEVICE),
-
-        "training_pipeline": {
-
-            "train":
-                "augmented_dataset/train",
-
-            "validation":
-                "dataset_split/valid",
-
-            "test":
-                "dataset_split/test",
-
-            "augmentation":
-                "train only",
-
-            "runtime_augmentation":
-                False
-
-        },
-
-        "soil_model":
-            False,
-
-        "crop_prediction":
-            False,
-
-        "docs":
-            "/docs"
-
+        "status": "running", "application": "Capsicum Plant Condition Detection API",
+        "model_loaded": model is not None, "model": "ResNet50",
+        "architecture": MODEL_ARCHITECTURE, "fine_tuned_layers": ["layer4", "fc"],
+        "num_classes": NUM_CLASSES, "classes": MODEL_CLASSES,
+        "input_size": "224x224", "device": str(DEVICE), "docs": "/docs",
+        "augmentation": {"method": "Adaptive offline augmentation", "applied_to": "training set only",
+                          "validation_augmented": False, "test_augmented": False,
+                          "runtime_augmentation": False},
+        "soil_model_included": False,
     }
 
 
-# ============================================================
-# HEALTH API
-# ============================================================
-
-@app.get(
-    "/health"
-)
+@app.get("/health")
 def health():
-
-    return {
-
-        "status":
-            "healthy",
-
-        "cnn_model_loaded":
-            model is not None,
-
-        "model":
-            "ResNet50",
-
-        "architecture":
-            MODEL_ARCHITECTURE,
-
-        "num_classes":
-            len(MODEL_CLASSES),
-
-        "device":
-            str(DEVICE)
-
-    }
+    return {"status": "healthy" if model is not None else "model_not_loaded",
+            "cnn_model_loaded": model is not None, "model": "ResNet50",
+            "num_classes": len(MODEL_CLASSES), "device": str(DEVICE)}
 
 
-# ============================================================
-# CLASS LIST
-# ============================================================
-
-@app.get(
-    "/classes"
-)
+@app.get("/classes")
 def classes():
-
-    return {
-
-        "num_classes":
-            len(MODEL_CLASSES),
-
-        "classes":
-            MODEL_CLASSES
-
-    }
+    return {"num_classes": len(MODEL_CLASSES), "classes": MODEL_CLASSES}
 
 
-# ============================================================
-# MODEL INFORMATION
-# ============================================================
-
-@app.get(
-    "/model-info"
-)
+@app.get("/model-info")
 def model_info():
-
     result = {
-
-        "architecture":
-            "ResNet50",
-
-        "classifier_architecture":
-            MODEL_ARCHITECTURE,
-
-        "framework":
-            "PyTorch",
-
-        "input_size":
-            "224x224",
-
-        "num_classes":
-            NUM_CLASSES,
-
-        "classes":
-            MODEL_CLASSES,
-
-        "fine_tuned_layers":
-            "Layer4 + FC",
-
-        "dropout":
-            DROPOUT,
-
-        "device":
-            str(DEVICE),
-
-        "model_path":
-            MODEL_PATH,
-
-        "training_data":
-            {
-
-                "train":
-                    TRAIN_DIR,
-
-                "validation":
-                    VALID_DIR,
-
-                "test":
-                    TEST_DIR
-
-            }
-
+        "model": "ResNet50", "architecture": MODEL_ARCHITECTURE,
+        "framework": "PyTorch", "input_size": "224x224", "input_features": 2048,
+        "num_classes": NUM_CLASSES, "classes": MODEL_CLASSES,
+        "fine_tuned_layers": ["layer4", "fc"], "dropout": DROPOUT,
+        "device": str(DEVICE), "model_path": MODEL_PATH,
+        "checkpoint_exists": os.path.isfile(MODEL_PATH),
+        "training_data": {"train": TRAIN_DIR, "validation": VALID_DIR, "test": TEST_DIR},
+        "preprocessing": ["Resize(224,224)", "ToTensor()", "ImageNet normalization"],
     }
-
-    # --------------------------------------------------------
-    # Optional checkpoint metadata
-    # --------------------------------------------------------
-
-    if isinstance(
-        CHECKPOINT_INFO,
-        dict
-    ):
-
-        if "epoch" in CHECKPOINT_INFO:
-
-            try:
-
-                result[
-                    "best_model_epoch"
-                ] = (
-
-                    int(
-                        CHECKPOINT_INFO[
-                            "epoch"
-                        ]
-                    ) + 1
-
-                )
-
-            except (
-                ValueError,
-                TypeError
-            ):
-
-                result[
-                    "best_model_epoch"
-                ] = str(
-
-                    CHECKPOINT_INFO[
-                        "epoch"
-                    ]
-
-                )
-
-        if "best_train_accuracy" in CHECKPOINT_INFO:
-
-            try:
-
-                result[
-                    "best_train_accuracy"
-                ] = float(
-
-                    CHECKPOINT_INFO[
-                        "best_train_accuracy"
-                    ]
-
-                )
-
-            except (
-                ValueError,
-                TypeError
-            ):
-
-                result[
-                    "best_train_accuracy"
-                ] = str(
-
-                    CHECKPOINT_INFO[
-                        "best_train_accuracy"
-                    ]
-
-                )
-
-        if "best_valid_accuracy" in CHECKPOINT_INFO:
-
-            try:
-
-                result[
-                    "best_valid_accuracy"
-                ] = float(
-
-                    CHECKPOINT_INFO[
-                        "best_valid_accuracy"
-                    ]
-
-                )
-
-            except (
-                ValueError,
-                TypeError
-            ):
-
-                result[
-                    "best_valid_accuracy"
-                ] = str(
-
-                    CHECKPOINT_INFO[
-                        "best_valid_accuracy"
-                    ]
-
-                )
-
-        if "architecture" in CHECKPOINT_INFO:
-
-            result[
-                "checkpoint_architecture"
-            ] = str(
-
-                CHECKPOINT_INFO[
-                    "architecture"
-                ]
-
-            )
-
-        if "num_classes" in CHECKPOINT_INFO:
-
-            try:
-
-                result[
-                    "checkpoint_num_classes"
-                ] = int(
-
-                    CHECKPOINT_INFO[
-                        "num_classes"
-                    ]
-
-                )
-
-            except (
-                ValueError,
-                TypeError
-            ):
-
-                result[
-                    "checkpoint_num_classes"
-                ] = str(
-
-                    CHECKPOINT_INFO[
-                        "num_classes"
-                    ]
-
-                )
-
+    for key in ("epoch", "best_train_accuracy", "best_valid_accuracy", "architecture", "num_classes"):
+        if key in CHECKPOINT_INFO:
+            output_key = "best_model_epoch" if key == "epoch" else key
+            value = CHECKPOINT_INFO[key]
+            if key == "epoch" and isinstance(value, int):
+                value += 1
+            result[output_key] = value
     return result
 
 
-# ============================================================
-# CLASS INFORMATION
-# ============================================================
-
-@app.get(
-    "/class-info/{class_name}"
-)
-def get_class_info(
-    class_name: str
-):
-
-    # --------------------------------------------------------
-    # Exact match
-    # --------------------------------------------------------
-
-    if class_name in CLASS_INFO:
-
-        return {
-
-            "class":
-                class_name,
-
-            "information":
-                CLASS_INFO[
-                    class_name
-                ]
-
-        }
-
-    # --------------------------------------------------------
-    # Case-insensitive match
-    # --------------------------------------------------------
-
-    normalized_name = (
-        class_name.strip().lower()
-    )
-
-    for existing_name in CLASS_INFO:
-
-        if (
-            existing_name.lower()
-            ==
-            normalized_name
-        ):
-
-            return {
-
-                "class":
-                    existing_name,
-
-                "information":
-                    CLASS_INFO[
-                        existing_name
-                    ]
-
-            }
-
-    # --------------------------------------------------------
-    # Not found
-    # --------------------------------------------------------
-
-    raise HTTPException(
-
-        status_code=404,
-
-        detail={
-
-            "message":
-                "Class information not found",
-
-            "requested_class":
-                class_name,
-
-            "available_classes":
-                list(
-                    CLASS_INFO.keys()
-                )
-
-        }
-
-    )
+@app.get("/class-info/{class_name}")
+def get_class_info(class_name: str):
+    target = class_name.strip().casefold()
+    for name, info in CLASS_INFO.items():
+        if name.strip().casefold() == target:
+            return {"class": name, "information": info}
+    raise HTTPException(status_code=404, detail={
+        "message": "Class information not found", "requested_class": class_name,
+        "available_classes": list(CLASS_INFO.keys()),
+    })
 
 
-# ============================================================
-# DATASET INFORMATION
-#
-# IMPORTANT:
-#
-# Train:
-#     augmented_dataset/train
-#
-# Validation:
-#     dataset_split/valid
-#
-# Test:
-#     dataset_split/test
-#
-# Therefore validation/test remain untouched.
-# ============================================================
-
-@app.get(
-    "/dataset"
-)
+@app.get("/dataset")
 def dataset_info():
-
-    train_count = count_images(
-        TRAIN_DIR
-    )
-
-    valid_count = count_images(
-        VALID_DIR
-    )
-
-    test_count = count_images(
-        TEST_DIR
-    )
-
+    train_counts = count_images_per_class(TRAIN_DIR)
+    train_count, valid_count, test_count = count_images(TRAIN_DIR), count_images(VALID_DIR), count_images(TEST_DIR)
     return {
-
-        "train_images":
-            train_count,
-
-        "validation_images":
-            valid_count,
-
-        "test_images":
-            test_count,
-
-        "total_images":
-
-            (
-                train_count
-                +
-                valid_count
-                +
-                test_count
-            ),
-
-        "num_classes":
-            NUM_CLASSES,
-
-        "classes":
-            MODEL_CLASSES,
-
-        "train_directory":
-            TRAIN_DIR,
-
-        "validation_directory":
-            VALID_DIR,
-
-        "test_directory":
-            TEST_DIR,
-
-        "augmentation":
-            "Train only",
-
-        "validation_test_augmented":
-            False
-
+        "train_images": train_count, "validation_images": valid_count, "test_images": test_count,
+        "total_images": train_count + valid_count + test_count, "num_classes": NUM_CLASSES,
+        "train_target_per_class": TRAIN_TARGET, "expected_train_total": EXPECTED_TRAIN_TOTAL,
+        "train_total_correct": train_count == EXPECTED_TRAIN_TOTAL,
+        "all_train_classes_1100": all(v == TRAIN_TARGET for v in train_counts.values()),
+        "class_counts": train_counts, "train_directory": TRAIN_DIR,
+        "validation_directory": VALID_DIR, "test_directory": TEST_DIR,
+        "augmentation": "Adaptive offline augmentation; training only",
+        "validation_test_augmented": False,
     }
 
 
-# ============================================================
-# DATASET CLASS-WISE
-# ============================================================
-
-@app.get(
-    "/dataset/class-wise"
-)
+@app.get("/dataset/class-wise")
 def dataset_class_wise():
-
-    train_counts = count_images_per_class(
-        TRAIN_DIR
-    )
-
-    valid_counts = count_images_per_class(
-        VALID_DIR
-    )
-
-    test_counts = count_images_per_class(
-        TEST_DIR
-    )
-
-    result = {}
-
-    for class_name in MODEL_CLASSES:
-
-        result[class_name] = {
-
-            "train":
-                train_counts.get(
-                    class_name,
-                    0
-                ),
-
-            "validation":
-                valid_counts.get(
-                    class_name,
-                    0
-                ),
-
-            "test":
-                test_counts.get(
-                    class_name,
-                    0
-                )
-
-        }
-
-    return {
-
-        "num_classes":
-            NUM_CLASSES,
-
-        "classes":
-            result
-
-    }
-
-
-# ============================================================
-# PREDICT IMAGE
-# ============================================================
-
-def predict_image(
-    image: Image.Image
-):
-
-    if model is None:
-
-        raise RuntimeError(
-            "Model is not loaded."
-        )
-
-    # --------------------------------------------------------
-    # RGB
-    # --------------------------------------------------------
-
-    image = image.convert(
-        "RGB"
-    )
-
-    # --------------------------------------------------------
-    # Transform
-    # --------------------------------------------------------
-
-    tensor = INFERENCE_TRANSFORM(
-        image
-    )
-
-    # --------------------------------------------------------
-    # Batch dimension
-    # --------------------------------------------------------
-
-    tensor = tensor.unsqueeze(
-        0
-    )
-
-    # --------------------------------------------------------
-    # Device
-    # --------------------------------------------------------
-
-    tensor = tensor.to(
-        DEVICE
-    )
-
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
-
-    with torch.inference_mode():
-
-        output = model(
-            tensor
-        )
-
-    # --------------------------------------------------------
-    # Softmax
-    # --------------------------------------------------------
-
-    probabilities = torch.softmax(
-
-        output,
-
-        dim=1
-
-    )
-
-    # --------------------------------------------------------
-    # Top K
-    # --------------------------------------------------------
-
-    top_k = min(
-
-        TOP_K,
-
-        len(MODEL_CLASSES)
-
-    )
-
-    top_probabilities, top_indices = torch.topk(
-
-        probabilities,
-
-        top_k,
-
-        dim=1
-
-    )
-
-    # --------------------------------------------------------
-    # Prediction list
-    # --------------------------------------------------------
-
-    predictions = []
-
-    for rank in range(
-        top_k
-    ):
-
-        index = (
-
-            top_indices[
-                0
-            ][
-                rank
-            ].item()
-
-        )
-
-        confidence = (
-
-            top_probabilities[
-                0
-            ][
-                rank
-            ].item()
-
-            *
-
-            100.0
-
-        )
-
-        class_name = (
-
-            MODEL_CLASSES[
-                index
-            ]
-
-        )
-
-        predictions.append({
-
-            "rank":
-                rank + 1,
-
-            "class":
-                class_name,
-
-            "class_index":
-                index,
-
-            "confidence_percent":
-                round(
-                    confidence,
-                    4
-                ),
-
-            "class_information":
-                CLASS_INFO.get(
-                    class_name,
-                    {}
-                )
-
-        })
-
-    # --------------------------------------------------------
-    # Primary prediction
-    # --------------------------------------------------------
-
-    primary = predictions[0]
-
-    confidence = primary[
-        "confidence_percent"
-    ]
-
-    # --------------------------------------------------------
-    # Confidence level
-    # --------------------------------------------------------
-
-    if confidence >= 90:
-
-        confidence_level = "HIGH"
-
-    elif confidence >= 70:
-
-        confidence_level = "MEDIUM"
-
-    elif confidence >= 50:
-
-        confidence_level = "LOW"
-
-    else:
-
-        confidence_level = "VERY LOW"
-
-    # --------------------------------------------------------
-    # Warning
-    # --------------------------------------------------------
-
-    warning = None
-
-    if confidence < 50:
-
-        warning = (
-
-            "Low model confidence. "
-
-            "The image may differ from the "
-
-            "training distribution or may not "
-
-            "belong to one of the supported classes."
-
-        )
-
-    # --------------------------------------------------------
-    # Final result
-    # --------------------------------------------------------
-
-    return {
-
-        "predicted_class":
-            primary[
-                "class"
-            ],
-
-        "class_index":
-            primary[
-                "class_index"
-            ],
-
-        "confidence_percent":
-            primary[
-                "confidence_percent"
-            ],
-
-        "confidence_level":
-            confidence_level,
-
-        "warning":
-            warning,
-
-        "class_information":
-            primary[
-                "class_information"
-            ],
-
-        "top_5_predictions":
-            predictions
-
-    }
-
-
-# ============================================================
-# READ UPLOADED IMAGE
-# ============================================================
-
-async def read_uploaded_image(
-    file: UploadFile
-):
-
-    allowed_types = {
-
-        "image/jpeg",
-
-        "image/png",
-
-        "image/webp",
-
-        "image/bmp",
-
-        "image/tiff"
-
-    }
-
-    # --------------------------------------------------------
-    # Content type
-    # --------------------------------------------------------
-
-    if file.content_type not in allowed_types:
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail=(
-
-                "Unsupported image format. "
-
-                "Allowed formats: "
-
-                "JPG, JPEG, PNG, WEBP, BMP, TIFF."
-
-            )
-
-        )
-
-    try:
-
-        # ----------------------------------------------------
-        # Read file
-        # ----------------------------------------------------
-
-        contents = await file.read()
-
-        if not contents:
-
-            raise HTTPException(
-
-                status_code=400,
-
-                detail="Uploaded file is empty."
-
-            )
-
-        # ----------------------------------------------------
-        # Open image
-        # ----------------------------------------------------
-
-        image = Image.open(
-
-            io.BytesIO(
-                contents
-            )
-
-        )
-
-        # Force actual image decoding
-        image.load()
-
-        # ----------------------------------------------------
-        # RGB
-        # ----------------------------------------------------
-
-        image = image.convert(
-            "RGB"
-        )
-
-        return image
-
-    except UnidentifiedImageError:
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail=(
-                "Uploaded file is not "
-                "a valid image."
-            )
-
-        )
-
-    except HTTPException:
-
-        raise
-
-    except Exception as error:
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail=(
-                f"Unable to read image: {error}"
-            )
-
-        )
-
-
-# ============================================================
-# SINGLE PREDICTION
-# ============================================================
-
-@app.post(
-    "/predict"
-)
-async def predict(
-
-    file: UploadFile = File(...)
-
-):
-
-    # --------------------------------------------------------
-    # Read image
-    # --------------------------------------------------------
-
-    image = await read_uploaded_image(
-        file
-    )
-
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
-
-    try:
-
-        prediction = predict_image(
-            image
-        )
-
-    except Exception as error:
-
-        raise HTTPException(
-
-            status_code=500,
-
-            detail=(
-                f"Prediction failed: {error}"
-            )
-
-        )
-
-    # --------------------------------------------------------
-    # Response
-    # --------------------------------------------------------
-
-    return {
-
-        "success":
-            True,
-
-        "filename":
-            file.filename,
-
-        "image_width":
-            image.width,
-
-        "image_height":
-            image.height,
-
-        "model":
-            "ResNet50",
-
-        "architecture":
-            MODEL_ARCHITECTURE,
-
-        "num_classes":
-            NUM_CLASSES,
-
-        "device":
-            str(DEVICE),
-
-        "prediction":
-            prediction
-
-    }
-
-
-# ============================================================
-# BATCH PREDICTION
-# ============================================================
-
-@app.post(
-    "/predict-batch"
-)
-async def predict_batch(
-
-    files: List[
-        UploadFile
-    ] = File(...)
-
-):
-
-    if len(files) == 0:
-
-        raise HTTPException(
-
-            status_code=400,
-
-            detail=(
-                "No images were uploaded."
-            )
-
-        )
-
+    train, valid, test = (count_images_per_class(p) for p in (TRAIN_DIR, VALID_DIR, TEST_DIR))
+    return {"num_classes": NUM_CLASSES, "train_target_per_class": TRAIN_TARGET,
+            "expected_train_total": EXPECTED_TRAIN_TOTAL,
+            "classes": {name: {"train": train[name], "validation": valid[name], "test": test[name],
+                               "train_target": TRAIN_TARGET,
+                               "train_target_reached": train[name] == TRAIN_TARGET}
+                        for name in MODEL_CLASSES}}
+
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    image = await read_uploaded_image(file)
+    prediction = predict_image(image)
+    return {"success": True, "filename": file.filename,
+            "image_width": image.width, "image_height": image.height,
+            "model": "ResNet50", "architecture": MODEL_ARCHITECTURE,
+            "fine_tuned_layers": ["layer4", "fc"], "num_classes": NUM_CLASSES,
+            "device": str(DEVICE), "prediction": prediction}
+
+
+@app.post("/predict-batch")
+async def predict_batch(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="No images were uploaded.")
+    if len(files) > 50:
+        raise HTTPException(status_code=400, detail="Upload a maximum of 50 images per batch.")
     results = []
-
     for file in files:
-
         try:
+            image = await read_uploaded_image(file)
+            results.append({"filename": file.filename, "image_width": image.width,
+                            "image_height": image.height, "success": True,
+                            "prediction": predict_image(image)})
+        except HTTPException as exc:
+            results.append({"filename": file.filename, "success": False,
+                            "error": exc.detail, "status_code": exc.status_code})
+        except Exception as exc:
+            results.append({"filename": file.filename, "success": False, "error": str(exc)})
+    succeeded = sum(item["success"] for item in results)
+    return {"success": succeeded == len(results), "total_images": len(results),
+            "successful_predictions": succeeded, "failed_predictions": len(results) - succeeded,
+            "results": results}
 
-            # ------------------------------------------------
-            # Read image
-            # ------------------------------------------------
-
-            image = await read_uploaded_image(
-                file
-            )
-
-            # ------------------------------------------------
-            # Predict
-            # ------------------------------------------------
-
-            prediction = predict_image(
-                image
-            )
-
-            # ------------------------------------------------
-            # Result
-            # ------------------------------------------------
-
-            results.append({
-
-                "filename":
-                    file.filename,
-
-                "image_width":
-                    image.width,
-
-                "image_height":
-                    image.height,
-
-                "success":
-                    True,
-
-                "prediction":
-                    prediction
-
-            })
-
-        except Exception as error:
-
-            results.append({
-
-                "filename":
-                    file.filename,
-
-                "success":
-                    False,
-
-                "error":
-                    str(error)
-
-            })
-
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
-
-    successful = sum(
-
-        1
-
-        for result in results
-
-        if result["success"]
-
-    )
-
-    failed = (
-
-        len(results)
-        -
-        successful
-
-    )
-
-    # --------------------------------------------------------
-    # Response
-    # --------------------------------------------------------
-
-    return {
-
-        "success":
-            True,
-
-        "total_images":
-            len(files),
-
-        "successful_predictions":
-            successful,
-
-        "failed_predictions":
-            failed,
-
-        "results":
-            results
-
-    }
-
-
-# ============================================================
-# SERVER
-# ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
-
-    uvicorn.run(
-
-        "app:app",
-
-        host="0.0.0.0",
-
-        port=int(os.environ.get("PORT", 8080)),
-
-        reload=False
-
-    )
-
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), reload=False)

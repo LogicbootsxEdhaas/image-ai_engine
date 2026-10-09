@@ -1,35 +1,45 @@
+
 import os
-import copy
 import random
 import json
 import time
+import copy
 
 import numpy as np
+
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
 
+from torchvision import datasets, transforms, models
+
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
     classification_report,
-    confusion_matrix
+    confusion_matrix,
+    accuracy_score
 )
 
+
 # ============================================================
-# 1. PATH CONFIGURATION
+# BASE DIRECTORY
 # ============================================================
 
 BASE_DIR = os.path.dirname(
     os.path.abspath(__file__)
 )
+
+
+# ============================================================
+# DIRECTORY CONFIGURATION
+# ============================================================
 
 TRAIN_DIR = os.path.join(
     BASE_DIR,
@@ -39,13 +49,13 @@ TRAIN_DIR = os.path.join(
 
 VALID_DIR = os.path.join(
     BASE_DIR,
-    "dataset_split",
+    "augmented_dataset",
     "valid"
 )
 
 TEST_DIR = os.path.join(
     BASE_DIR,
-    "dataset_split",
+    "augmented_dataset",
     "test"
 )
 
@@ -59,36 +69,70 @@ RESULT_DIR = os.path.join(
     "training_results"
 )
 
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(RESULT_DIR, exist_ok=True)
+
+# ============================================================
+# CREATE OUTPUT DIRECTORIES
+# ============================================================
+
+os.makedirs(
+    MODEL_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    RESULT_DIR,
+    exist_ok=True
+)
 
 
 # ============================================================
-# 2. CLASS CONFIGURATION
+# CLASS CONFIGURATION
 # ============================================================
 
-CLASSES = [
+CLASS_NAMES = [
+
     "Anthracnose",
+
     "Larva",
+
     "Magnesium",
+
+    "Phytophthora blight",
+
     "bacterial spot",
+
     "blossom-end rot",
+
     "down leaf aphid",
+
     "fruit thrips",
+
     "healthy",
+
     "powdery mildew",
+
     "snail",
+
     "upperleaf thrips",
+
     "virus"
 ]
 
-NUM_CLASSES = len(CLASSES)
+
+NUM_CLASSES = len(
+    CLASS_NAMES
+)
 
 TRAIN_TARGET = 1100
 
+EXPECTED_TRAIN_TOTAL = (
+    NUM_CLASSES
+    * TRAIN_TARGET
+)
+
 
 # ============================================================
-# 3. TRAINING CONFIGURATION
+# TRAINING CONFIGURATION
 # ============================================================
 
 IMAGE_SIZE = 224
@@ -109,116 +153,339 @@ PATIENCE = 3
 
 MIN_DELTA = 0.001
 
+GRADIENT_CLIP = 1.0
+
 SEED = 42
 
 
 # ============================================================
-# 4. REPRODUCIBILITY
+# OFFLINE AUGMENTATION CONFIGURATION
+# ============================================================
+#
+# These settings describe augmentation.py.
+# Actual augmentation is NOT performed here.
 # ============================================================
 
-def set_seed(seed=42):
+AUGMENTATION_CONFIG = {
 
-    random.seed(seed)
+    "method": "Offline augmentation",
 
-    np.random.seed(seed)
+    "source": "augmentation.py",
 
-    torch.manual_seed(seed)
+    "train_only": True,
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+    "validation_augmented": False,
 
-    torch.backends.cudnn.deterministic = True
+    "test_augmented": False,
 
-    torch.backends.cudnn.benchmark = False
+    "target_per_class": TRAIN_TARGET,
 
+    "levels": {
 
-set_seed(SEED)
+        "strong": {
+            "condition": "< 300"
+        },
+
+        "moderate_strong": {
+            "condition": "300 - 500"
+        },
+
+        "moderate": {
+            "condition": "501 - 800"
+        },
+
+        "light": {
+            "condition": "801 - 1000"
+        },
+
+        "very_light": {
+            "condition": "1001 - 1100"
+        },
+
+        "none": {
+            "condition": "> 1100"
+        }
+
+    }
+
+}
 
 
 # ============================================================
-# 5. DEVICE
+# IMAGENET NORMALIZATION
 # ============================================================
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+IMAGENET_MEAN = [
+
+    0.485,
+
+    0.456,
+
+    0.406
+]
+
+
+IMAGENET_STD = [
+
+    0.229,
+
+    0.224,
+
+    0.225
+]
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+random.seed(
+    SEED
+)
+
+np.random.seed(
+    SEED
+)
+
+torch.manual_seed(
+    SEED
 )
 
 
+if torch.cuda.is_available():
+
+    torch.cuda.manual_seed(
+        SEED
+    )
+
+    torch.cuda.manual_seed_all(
+        SEED
+    )
+
+
 # ============================================================
-# 6. PRINT CONFIGURATION
+# CUDA SETTINGS
 # ============================================================
 
-print("\n")
+torch.backends.cudnn.deterministic = True
+
+torch.backends.cudnn.benchmark = False
+
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+if torch.cuda.is_available():
+
+    device = torch.device(
+        "cuda"
+    )
+
+else:
+
+    device = torch.device(
+        "cpu"
+    )
+
+
+# ============================================================
+# START MESSAGE
+# ============================================================
+
+print()
+
 print("=" * 80)
-print("CAPSICUM RESNET50 - FINAL TRAINING")
-print("=" * 80)
 
-print(f"Device       : {DEVICE}")
-print(f"Image size   : {IMAGE_SIZE}")
-print(f"Batch size   : {BATCH_SIZE}")
-print(f"Epochs       : {EPOCHS}")
-print(f"Learning rate: {LEARNING_RATE}")
-print(f"Weight decay : {WEIGHT_DECAY}")
-print(f"Train target : {TRAIN_TARGET}")
-print(f"Num classes  : {NUM_CLASSES}")
-
-print("\nPaths:")
-print(f"Train        : {TRAIN_DIR}")
-print(f"Validation   : {VALID_DIR}")
-print(f"Test         : {TEST_DIR}")
-print(f"Models       : {MODEL_DIR}")
-print(f"Results      : {RESULT_DIR}")
+print(
+    "CAPSICUM RESNET50 - IMPROVED FINAL TRAINING"
+)
 
 print("=" * 80)
 
+print()
+
+print(
+    "Device:",
+    device
+)
+
+print(
+    "Number of classes:",
+    NUM_CLASSES
+)
+
+print(
+    "Image size:",
+    IMAGE_SIZE
+)
+
+print(
+    "Batch size:",
+    BATCH_SIZE
+)
+
+print(
+    "Epochs:",
+    EPOCHS
+)
+
+print(
+    "Learning rate:",
+    LEARNING_RATE
+)
+
+print(
+    "Weight decay:",
+    WEIGHT_DECAY
+)
+
+print(
+    "Dropout:",
+    DROPOUT
+)
+
+print(
+    "Gradient clipping:",
+    GRADIENT_CLIP
+)
+
+print()
+
+print(
+    "Offline augmentation:"
+)
+
+print(
+    "  <300       -> STRONG"
+)
+
+print(
+    "  300-500    -> MODERATE-STRONG"
+)
+
+print(
+    "  501-800    -> MODERATE"
+)
+
+print(
+    "  801-1000   -> LIGHT"
+)
+
+print(
+    "  1001-1100  -> VERY-LIGHT"
+)
+
+print(
+    "  >1100      -> NONE"
+)
+
+print()
+
 
 # ============================================================
-# 7. CHECK DIRECTORIES
+# PATH CHECK
 # ============================================================
 
-for directory in [
-    TRAIN_DIR,
-    VALID_DIR,
+print("=" * 80)
+
+print(
+    "CHECKING DATASET PATHS"
+)
+
+print("=" * 80)
+
+print()
+
+print(
+    "Train directory:"
+)
+
+print(
+    TRAIN_DIR
+)
+
+print()
+
+print(
+    "Validation directory:"
+)
+
+print(
+    VALID_DIR
+)
+
+print()
+
+print(
+    "Test directory:"
+)
+
+print(
     TEST_DIR
-]:
+)
 
-    if not os.path.isdir(directory):
+print()
 
-        raise FileNotFoundError(
-            f"\nRequired directory not found:\n{directory}"
-        )
+
+if not os.path.isdir(
+    TRAIN_DIR
+):
+
+    raise FileNotFoundError(
+        f"Training directory not found:\n{TRAIN_DIR}"
+    )
+
+
+if not os.path.isdir(
+    VALID_DIR
+):
+
+    raise FileNotFoundError(
+        f"Validation directory not found:\n{VALID_DIR}"
+    )
+
+
+if not os.path.isdir(
+    TEST_DIR
+):
+
+    raise FileNotFoundError(
+        f"Test directory not found:\n{TEST_DIR}"
+    )
 
 
 # ============================================================
-# 8. TRANSFORMS
+# TRANSFORMS
 # ============================================================
 #
 # IMPORTANT:
-# augmentation2.py already performs OFFLINE augmentation.
 #
-# Therefore we DO NOT perform random augmentation again here.
+# augmentation.py has already performed offline augmentation.
 #
-# This avoids:
-#     augmented image
-#          +
-#     random augmentation
-#          =
-#     unnecessary double augmentation
+# Therefore:
 #
+# TRAIN -> Resize + Normalize
+# VALID -> Resize + Normalize
+# TEST  -> Resize + Normalize
+#
+# No random augmentation here.
 # ============================================================
 
 train_transform = transforms.Compose([
 
     transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
+        (
+            IMAGE_SIZE,
+            IMAGE_SIZE
+        )
     ),
 
     transforms.ToTensor(),
 
     transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD
     )
 ])
 
@@ -226,14 +493,17 @@ train_transform = transforms.Compose([
 valid_transform = transforms.Compose([
 
     transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
+        (
+            IMAGE_SIZE,
+            IMAGE_SIZE
+        )
     ),
 
     transforms.ToTensor(),
 
     transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD
     )
 ])
 
@@ -241,216 +511,332 @@ valid_transform = transforms.Compose([
 test_transform = transforms.Compose([
 
     transforms.Resize(
-        (IMAGE_SIZE, IMAGE_SIZE)
+        (
+            IMAGE_SIZE,
+            IMAGE_SIZE
+        )
     ),
 
     transforms.ToTensor(),
 
     transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD
     )
 ])
 
 
 # ============================================================
-# 9. LOAD DATASETS
+# LOAD DATASETS
 # ============================================================
 
-print("\nLoading datasets...")
+print("=" * 80)
+
+print(
+    "LOADING DATASETS"
+)
+
+print("=" * 80)
+
+print()
 
 
 train_dataset = datasets.ImageFolder(
+
     TRAIN_DIR,
+
     transform=train_transform
 )
 
 
 valid_dataset = datasets.ImageFolder(
+
     VALID_DIR,
+
     transform=valid_transform
 )
 
 
 test_dataset = datasets.ImageFolder(
+
     TEST_DIR,
+
     transform=test_transform
 )
 
 
 # ============================================================
-# 10. CLASS ORDER VALIDATION
+# CLASS ORDER CHECK
 # ============================================================
 
-print("\nDetected class order:")
+print(
+    "Detected train classes:"
+)
 
-print("Train:")
-print(train_dataset.classes)
+print(
+    train_dataset.classes
+)
 
-print("\nValidation:")
-print(valid_dataset.classes)
+print()
 
-print("\nTest:")
-print(test_dataset.classes)
+print(
+    "Detected validation classes:"
+)
+
+print(
+    valid_dataset.classes
+)
+
+print()
+
+print(
+    "Detected test classes:"
+)
+
+print(
+    test_dataset.classes
+)
+
+print()
 
 
-expected_classes = CLASSES
+if train_dataset.classes != CLASS_NAMES:
 
+    raise ValueError(
 
-if train_dataset.classes != expected_classes:
+        "\nTrain class order mismatch!\n\n"
 
-    raise RuntimeError(
-        "\nTRAIN CLASS ORDER MISMATCH!\n"
-        f"Expected:\n{expected_classes}\n"
+        f"Expected:\n{CLASS_NAMES}\n\n"
+
         f"Found:\n{train_dataset.classes}"
     )
 
 
-if valid_dataset.classes != expected_classes:
+if valid_dataset.classes != CLASS_NAMES:
 
-    raise RuntimeError(
-        "\nVALIDATION CLASS ORDER MISMATCH!\n"
-        f"Expected:\n{expected_classes}\n"
+    raise ValueError(
+
+        "\nValidation class order mismatch!\n\n"
+
+        f"Expected:\n{CLASS_NAMES}\n\n"
+
         f"Found:\n{valid_dataset.classes}"
     )
 
 
-if test_dataset.classes != expected_classes:
+if test_dataset.classes != CLASS_NAMES:
 
-    raise RuntimeError(
-        "\nTEST CLASS ORDER MISMATCH!\n"
-        f"Expected:\n{expected_classes}\n"
+    raise ValueError(
+
+        "\nTest class order mismatch!\n\n"
+
+        f"Expected:\n{CLASS_NAMES}\n\n"
+
         f"Found:\n{test_dataset.classes}"
     )
 
 
-print("\nClass order verified successfully.")
-
-
 # ============================================================
-# 11. DATASET COUNTS
+# DATASET COUNT FUNCTION
 # ============================================================
 
-def get_class_counts(dataset):
+def count_dataset_classes(
+    dataset
+):
 
     counts = {
+
         class_name: 0
-        for class_name in CLASSES
+
+        for class_name in CLASS_NAMES
     }
+
 
     for _, label in dataset.samples:
 
-        class_name = dataset.classes[label]
+        class_name = (
+            dataset.classes[label]
+        )
 
         counts[class_name] += 1
+
 
     return counts
 
 
-train_counts = get_class_counts(train_dataset)
+# ============================================================
+# DATASET COUNTS
+# ============================================================
 
-valid_counts = get_class_counts(valid_dataset)
+train_counts = count_dataset_classes(
+    train_dataset
+)
 
-test_counts = get_class_counts(test_dataset)
+valid_counts = count_dataset_classes(
+    valid_dataset
+)
+
+test_counts = count_dataset_classes(
+    test_dataset
+)
 
 
-print("\n")
+# ============================================================
+# PRINT TRAIN COUNTS
+# ============================================================
+
 print("=" * 80)
-print("DATASET COUNTS")
+
+print(
+    "TRAIN DATASET COUNTS"
+)
+
 print("=" * 80)
 
-print("\nTRAIN:")
+print()
 
-for class_name in CLASSES:
+
+for class_name in CLASS_NAMES:
 
     print(
+
         f"{class_name:<25} : "
         f"{train_counts[class_name]}"
     )
 
 
-print("\nVALIDATION:")
+print()
 
-for class_name in CLASSES:
+print(
+    "Total training images:",
+    len(train_dataset)
+)
+
+print(
+    "Expected training images:",
+    EXPECTED_TRAIN_TOTAL
+)
+
+print()
+
+
+# ============================================================
+# EXACT TRAIN DATASET VALIDATION
+# ============================================================
+
+if len(train_dataset) != EXPECTED_TRAIN_TOTAL:
+
+    raise ValueError(
+
+        "\nTraining dataset size is incorrect!\n"
+
+        f"Expected: {EXPECTED_TRAIN_TOTAL}\n"
+
+        f"Found: {len(train_dataset)}\n\n"
+
+        "Run augmentation.py again."
+    )
+
+
+for class_name in CLASS_NAMES:
+
+    count = train_counts[
+        class_name
+    ]
+
+
+    if count != TRAIN_TARGET:
+
+        raise ValueError(
+
+            f"\nIncorrect train count "
+            f"for {class_name}\n"
+
+            f"Expected: {TRAIN_TARGET}\n"
+
+            f"Found: {count}"
+        )
+
+
+print(
+    "SUCCESS: Every training class "
+    f"contains exactly {TRAIN_TARGET} images."
+)
+
+print()
+
+
+# ============================================================
+# VALIDATION COUNTS
+# ============================================================
+
+print("=" * 80)
+
+print(
+    "VALIDATION COUNTS"
+)
+
+print("=" * 80)
+
+print()
+
+
+for class_name in CLASS_NAMES:
 
     print(
+
         f"{class_name:<25} : "
         f"{valid_counts[class_name]}"
     )
 
 
-print("\nTEST:")
+print()
 
-for class_name in CLASSES:
+print(
+    "Total validation images:",
+    len(valid_dataset)
+)
+
+print()
+
+
+# ============================================================
+# TEST COUNTS
+# ============================================================
+
+print("=" * 80)
+
+print(
+    "TEST COUNTS"
+)
+
+print("=" * 80)
+
+print()
+
+
+for class_name in CLASS_NAMES:
 
     print(
+
         f"{class_name:<25} : "
         f"{test_counts[class_name]}"
     )
 
 
-# ============================================================
-# 12. VERIFY TRAIN = 1100/CLASS
-# ============================================================
-
-print("\nChecking training balance...")
-
-for class_name in CLASSES:
-
-    count = train_counts[class_name]
-
-    if count != TRAIN_TARGET:
-
-        raise RuntimeError(
-            f"\nTRAIN DATA ERROR:\n"
-            f"Class '{class_name}' has {count} images.\n"
-            f"Expected exactly {TRAIN_TARGET}."
-        )
-
+print()
 
 print(
-    f"Training dataset verified: "
-    f"{TRAIN_TARGET} images/class."
+    "Total test images:",
+    len(test_dataset)
 )
 
-
-# ============================================================
-# 13. DATASET TOTALS
-# ============================================================
-
-total_train = len(train_dataset)
-
-total_valid = len(valid_dataset)
-
-total_test = len(test_dataset)
-
-
-print("\nDataset totals:")
-
-print(f"Train      : {total_train}")
-
-print(f"Validation : {total_valid}")
-
-print(f"Test       : {total_test}")
-
-
-expected_train_total = TRAIN_TARGET * NUM_CLASSES
-
-
-if total_train != expected_train_total:
-
-    raise RuntimeError(
-        f"\nExpected {expected_train_total} training images "
-        f"but found {total_train}."
-    )
+print()
 
 
 # ============================================================
-# 14. DATA LOADERS
+# DATA LOADERS
 # ============================================================
-
-print("\nCreating DataLoaders...")
-
 
 train_loader = DataLoader(
 
@@ -495,33 +881,88 @@ test_loader = DataLoader(
 
 
 # ============================================================
-# 15. LOAD RESNET50
+# DATA LOADER INFORMATION
 # ============================================================
 
-print("\nLoading ResNet50...")
+print("=" * 80)
+
+print(
+    "DATA LOADERS READY"
+)
+
+print("=" * 80)
+
+print()
+
+print(
+    "Train batches:",
+    len(train_loader)
+)
+
+print(
+    "Validation batches:",
+    len(valid_loader)
+)
+
+print(
+    "Test batches:",
+    len(test_loader)
+)
+
+print()
+
+
+# ============================================================
+# LOAD RESNET50
+# ============================================================
+
+print("=" * 80)
+
+print(
+    "LOADING RESNET50"
+)
+
+print("=" * 80)
+
+print()
+
+
+pretrained_used = False
 
 
 try:
 
-    weights = models.ResNet50_Weights.DEFAULT
+    weights = (
+        models.ResNet50_Weights.DEFAULT
+    )
 
     model = models.resnet50(
         weights=weights
     )
 
-    print("Pretrained ImageNet weights loaded.")
+    pretrained_used = True
+
+    print(
+        "ImageNet pretrained weights loaded."
+    )
 
 
 except Exception as e:
 
     print(
-        "\nWARNING: Could not load pretrained weights."
+        "WARNING: Could not load "
+        "ImageNet pretrained weights."
     )
 
-    print(f"Reason: {e}")
+    print(
+        "Reason:",
+        e
+    )
+
+    print()
 
     print(
-        "Continuing with weights=None."
+        "Using ResNet50 without pretrained weights."
     )
 
     model = models.resnet50(
@@ -530,29 +971,26 @@ except Exception as e:
 
 
 # ============================================================
-# 16. FREEZE ALL LAYERS
+# FREEZE EVERYTHING
 # ============================================================
 
-for parameter in model.parameters():
+for param in model.parameters():
 
-    parameter.requires_grad = False
-
-
-# ============================================================
-# 17. UNFREEZE LAYER4
-# ============================================================
-
-for parameter in model.layer4.parameters():
-
-    parameter.requires_grad = True
+    param.requires_grad = False
 
 
 # ============================================================
-# 18. REPLACE FINAL CLASSIFIER
+# UNFREEZE LAYER4
 # ============================================================
 
-in_features = model.fc.in_features
+for param in model.layer4.parameters():
 
+    param.requires_grad = True
+
+
+# ============================================================
+# REPLACE FC
+# ============================================================
 
 model.fc = nn.Sequential(
 
@@ -561,75 +999,195 @@ model.fc = nn.Sequential(
     ),
 
     nn.Linear(
-        in_features,
+        2048,
         NUM_CLASSES
     )
 )
 
 
-# Make sure FC is trainable.
+# FC automatically trainable,
+# but explicitly confirm.
 
-for parameter in model.fc.parameters():
+for param in model.fc.parameters():
 
-    parameter.requires_grad = True
-
-
-# ============================================================
-# 19. MOVE MODEL TO DEVICE
-# ============================================================
-
-model = model.to(DEVICE)
+    param.requires_grad = True
 
 
 # ============================================================
-# 20. TRAINABLE PARAMETERS
+# MOVE MODEL TO DEVICE
 # ============================================================
 
-trainable_parameters = sum(
-
-    parameter.numel()
-
-    for parameter in model.parameters()
-
-    if parameter.requires_grad
+model = model.to(
+    device
 )
 
 
-total_parameters = sum(
+# ============================================================
+# FROZEN BATCHNORM HELPER
+# ============================================================
 
-    parameter.numel()
+def freeze_frozen_batchnorm(
+    model
+):
 
-    for parameter in model.parameters()
+    for module in model.layer1.modules():
+
+        if isinstance(
+            module,
+            nn.BatchNorm2d
+        ):
+
+            module.eval()
+
+
+    for module in model.layer2.modules():
+
+        if isinstance(
+            module,
+            nn.BatchNorm2d
+        ):
+
+            module.eval()
+
+
+    for module in model.layer3.modules():
+
+        if isinstance(
+            module,
+            nn.BatchNorm2d
+        ):
+
+            module.eval()
+
+
+# ============================================================
+# MODEL CONFIGURATION
+# ============================================================
+
+print("=" * 80)
+
+print(
+    "FINE-TUNING CONFIGURATION"
 )
 
+print("=" * 80)
 
-print("\nModel information:")
+print()
+
+print(
+    "Layer1 : FROZEN"
+)
+
+print(
+    "Layer2 : FROZEN"
+)
+
+print(
+    "Layer3 : FROZEN"
+)
+
+print(
+    "Layer4 : TRAINABLE"
+)
+
+print(
+    "FC     : TRAINABLE"
+)
+
+print()
+
+print(
+    "FC:"
+)
+
+print(
+    model.fc
+)
+
+print()
+
+
+# ============================================================
+# PARAMETER COUNT
+# ============================================================
+
+total_params = 0
+
+trainable_params = 0
+
+frozen_params = 0
+
+
+for param in model.parameters():
+
+    parameter_count = (
+        param.numel()
+    )
+
+    total_params += (
+        parameter_count
+    )
+
+
+    if param.requires_grad:
+
+        trainable_params += (
+            parameter_count
+        )
+
+    else:
+
+        frozen_params += (
+            parameter_count
+        )
+
+
+print("=" * 80)
+
+print(
+    "MODEL PARAMETERS"
+)
+
+print("=" * 80)
+
+print()
 
 print(
     f"Total parameters     : "
-    f"{total_parameters:,}"
+    f"{total_params:,}"
 )
 
 print(
     f"Trainable parameters : "
-    f"{trainable_parameters:,}"
+    f"{trainable_params:,}"
+)
+
+print(
+    f"Frozen parameters    : "
+    f"{frozen_params:,}"
+)
+
+print()
+
+
+# ============================================================
+# LOSS
+# ============================================================
+
+criterion = nn.CrossEntropyLoss(
+
+    label_smoothing=0.05
 )
 
 
 # ============================================================
-# 21. LOSS FUNCTION
-# ============================================================
-
-criterion = nn.CrossEntropyLoss()
-
-
-# ============================================================
-# 22. OPTIMIZER
+# OPTIMIZER
 # ============================================================
 
 optimizer = optim.AdamW(
 
     filter(
+
         lambda parameter:
         parameter.requires_grad,
 
@@ -643,7 +1201,7 @@ optimizer = optim.AdamW(
 
 
 # ============================================================
-# 23. LR SCHEDULER
+# SCHEDULER
 # ============================================================
 
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -659,15 +1217,19 @@ scheduler = optim.lr_scheduler.ReduceLROnPlateau(
 
 
 # ============================================================
-# 24. AMP SETUP
+# AMP
 # ============================================================
 
-use_amp = DEVICE.type == "cuda"
+use_amp = (
+    device.type == "cuda"
+)
 
 
 if use_amp:
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(
+        "cuda"
+    )
 
 else:
 
@@ -675,12 +1237,31 @@ else:
 
 
 # ============================================================
-# 25. TRAIN ONE EPOCH
+# TRAIN ONE EPOCH
 # ============================================================
 
-def train_one_epoch():
+def train_one_epoch(
+
+    model,
+
+    loader,
+
+    criterion,
+
+    optimizer,
+
+    device,
+
+    scaler
+
+):
 
     model.train()
+
+    freeze_frozen_batchnorm(
+        model
+    )
+
 
     running_loss = 0.0
 
@@ -689,15 +1270,19 @@ def train_one_epoch():
     total = 0
 
 
-    for images, labels in train_loader:
+    for images, labels in loader:
 
         images = images.to(
-            DEVICE,
+
+            device,
+
             non_blocking=True
         )
 
         labels = labels.to(
-            DEVICE,
+
+            device,
+
             non_blocking=True
         )
 
@@ -707,79 +1292,161 @@ def train_one_epoch():
         )
 
 
-        if use_amp:
+        # ----------------------------------------------------
+        # CUDA AMP
+        # ----------------------------------------------------
 
-            with torch.cuda.amp.autocast():
+        if scaler is not None:
 
-                outputs = model(images)
+            with torch.autocast(
+
+                device_type="cuda",
+
+                dtype=torch.float16
+
+            ):
+
+                outputs = model(
+                    images
+                )
 
                 loss = criterion(
+
                     outputs,
+
                     labels
                 )
 
 
-            scaler.scale(loss).backward()
+            scaler.scale(
+                loss
+            ).backward()
 
-            scaler.step(optimizer)
+
+            scaler.unscale_(
+                optimizer
+            )
+
+
+            torch.nn.utils.clip_grad_norm_(
+
+                model.parameters(),
+
+                max_norm=GRADIENT_CLIP
+            )
+
+
+            scaler.step(
+                optimizer
+            )
 
             scaler.update()
 
 
+        # ----------------------------------------------------
+        # CPU
+        # ----------------------------------------------------
+
         else:
 
-            outputs = model(images)
+            outputs = model(
+                images
+            )
 
             loss = criterion(
+
                 outputs,
+
                 labels
             )
 
+
             loss.backward()
+
+
+            torch.nn.utils.clip_grad_norm_(
+
+                model.parameters(),
+
+                max_norm=GRADIENT_CLIP
+            )
+
 
             optimizer.step()
 
 
-        batch_size = images.size(0)
-
+        # ----------------------------------------------------
+        # LOSS
+        # ----------------------------------------------------
 
         running_loss += (
-            loss.item() * batch_size
+
+            loss.item()
+            * images.size(0)
         )
 
 
-        predictions = outputs.argmax(
-            dim=1
+        # ----------------------------------------------------
+        # ACCURACY
+        # ----------------------------------------------------
+
+        _, predicted = torch.max(
+
+            outputs,
+
+            1
+        )
+
+
+        total += (
+            labels.size(0)
         )
 
 
         correct += (
-            predictions == labels
+
+            predicted == labels
+
         ).sum().item()
 
 
-        total += batch_size
-
-
     epoch_loss = (
-        running_loss / total
+
+        running_loss
+        / total
     )
 
 
     epoch_accuracy = (
-        correct / total
+
+        correct
+        / total
+    ) * 100
+
+
+    return (
+
+        epoch_loss,
+
+        epoch_accuracy
     )
 
 
-    return epoch_loss, epoch_accuracy
-
-
 # ============================================================
-# 26. VALIDATION
+# VALIDATION
 # ============================================================
 
-@torch.no_grad()
-def validate():
+def validate_one_epoch(
+
+    model,
+
+    loader,
+
+    criterion,
+
+    device
+
+):
 
     model.eval()
 
@@ -790,76 +1457,89 @@ def validate():
     total = 0
 
 
-    for images, labels in valid_loader:
+    with torch.no_grad():
 
-        images = images.to(
-            DEVICE,
-            non_blocking=True
-        )
+        for images, labels in loader:
 
-        labels = labels.to(
-            DEVICE,
-            non_blocking=True
-        )
+            images = images.to(
+
+                device,
+
+                non_blocking=True
+            )
+
+            labels = labels.to(
+
+                device,
+
+                non_blocking=True
+            )
 
 
-        if use_amp:
+            outputs = model(
+                images
+            )
 
-            with torch.cuda.amp.autocast():
-
-                outputs = model(images)
-
-                loss = criterion(
-                    outputs,
-                    labels
-                )
-
-        else:
-
-            outputs = model(images)
 
             loss = criterion(
+
                 outputs,
+
                 labels
             )
 
 
-        batch_size = images.size(0)
+            running_loss += (
+
+                loss.item()
+                * images.size(0)
+            )
 
 
-        running_loss += (
-            loss.item() * batch_size
-        )
+            _, predicted = torch.max(
+
+                outputs,
+
+                1
+            )
 
 
-        predictions = outputs.argmax(
-            dim=1
-        )
+            total += (
+                labels.size(0)
+            )
 
 
-        correct += (
-            predictions == labels
-        ).sum().item()
+            correct += (
 
+                predicted == labels
 
-        total += batch_size
+            ).sum().item()
 
 
     epoch_loss = (
-        running_loss / total
+
+        running_loss
+        / total
     )
 
 
     epoch_accuracy = (
-        correct / total
+
+        correct
+        / total
+    ) * 100
+
+
+    return (
+
+        epoch_loss,
+
+        epoch_accuracy
     )
 
 
-    return epoch_loss, epoch_accuracy
-
-
 # ============================================================
-# 27. TRAINING VARIABLES
+# HISTORY
 # ============================================================
 
 history = {
@@ -876,41 +1556,55 @@ history = {
 }
 
 
-best_val_loss = float("inf")
+# ============================================================
+# BEST MODEL VARIABLES
+# ============================================================
+
+best_val_loss = float(
+    "inf"
+)
 
 best_val_accuracy = 0.0
 
 best_epoch = 0
 
-patience_counter = 0
-
 best_model_state = None
 
+patience_counter = 0
+
 
 # ============================================================
-# 28. TRAINING LOOP
+# TRAINING START
 # ============================================================
 
-print("\n")
+print()
+
 print("=" * 80)
-print("STARTING TRAINING")
+
+print(
+    "TRAINING STARTED"
+)
+
 print("=" * 80)
 
+print()
 
-training_start = time.time()
 
+training_start_time = (
+    time.time()
+)
+
+
+# ============================================================
+# TRAINING LOOP
+# ============================================================
 
 for epoch in range(
-    1,
-    EPOCHS + 1
+    EPOCHS
 ):
 
-    epoch_start = time.time()
-
-
-    print(
-        f"\nEpoch "
-        f"{epoch}/{EPOCHS}"
+    epoch_start_time = (
+        time.time()
     )
 
 
@@ -918,17 +1612,35 @@ for epoch in range(
     # TRAIN
     # --------------------------------------------------------
 
-    train_loss, train_accuracy = (
-        train_one_epoch()
+    train_loss, train_accuracy = train_one_epoch(
+
+        model,
+
+        train_loader,
+
+        criterion,
+
+        optimizer,
+
+        device,
+
+        scaler
     )
 
 
     # --------------------------------------------------------
-    # VALIDATE
+    # VALIDATION
     # --------------------------------------------------------
 
-    valid_loss, valid_accuracy = (
-        validate()
+    valid_loss, valid_accuracy = validate_one_epoch(
+
+        model,
+
+        valid_loader,
+
+        criterion,
+
+        device
     )
 
 
@@ -941,30 +1653,42 @@ for epoch in range(
     )
 
 
-    current_lr = optimizer.param_groups[0]["lr"]
+    current_lr = (
+        optimizer.param_groups[0]["lr"]
+    )
 
 
     # --------------------------------------------------------
-    # SAVE HISTORY
+    # HISTORY
     # --------------------------------------------------------
 
-    history["train_loss"].append(
+    history[
+        "train_loss"
+    ].append(
         train_loss
     )
 
-    history["train_accuracy"].append(
+    history[
+        "train_accuracy"
+    ].append(
         train_accuracy
     )
 
-    history["valid_loss"].append(
+    history[
+        "valid_loss"
+    ].append(
         valid_loss
     )
 
-    history["valid_accuracy"].append(
+    history[
+        "valid_accuracy"
+    ].append(
         valid_accuracy
     )
 
-    history["learning_rate"].append(
+    history[
+        "learning_rate"
+    ].append(
         current_lr
     )
 
@@ -974,72 +1698,88 @@ for epoch in range(
     # --------------------------------------------------------
 
     epoch_time = (
+
         time.time()
-        -
-        epoch_start
+        - epoch_start_time
     )
 
 
     # --------------------------------------------------------
-    # PRINT RESULTS
+    # PRINT
     # --------------------------------------------------------
 
+    print("=" * 80)
+
     print(
-        f"Train Loss: "
+        f"Epoch [{epoch + 1}/{EPOCHS}]"
+    )
+
+    print("=" * 80)
+
+    print()
+
+    print(
+        f"Train Loss      : "
         f"{train_loss:.4f}"
     )
 
     print(
-        f"Train Acc : "
-        f"{train_accuracy * 100:.2f}%"
+        f"Train Accuracy  : "
+        f"{train_accuracy:.2f}%"
     )
 
     print(
-        f"Valid Loss: "
+        f"Valid Loss      : "
         f"{valid_loss:.4f}"
     )
 
     print(
-        f"Valid Acc : "
-        f"{valid_accuracy * 100:.2f}%"
+        f"Valid Accuracy  : "
+        f"{valid_accuracy:.2f}%"
     )
 
     print(
-        f"LR        : "
+        f"Learning Rate   : "
         f"{current_lr:.8f}"
     )
 
     print(
-        f"Time      : "
-        f"{epoch_time:.1f}s"
+        f"Time            : "
+        f"{epoch_time:.2f} sec"
     )
 
+    print()
+
 
     # --------------------------------------------------------
-    # CHECK IMPROVEMENT
+    # BEST MODEL
     # --------------------------------------------------------
 
-    improvement = (
-        best_val_loss
-        -
+    if (
+
         valid_loss
-    )
+        < best_val_loss - MIN_DELTA
 
+    ):
 
-    if improvement > MIN_DELTA:
+        best_val_loss = (
+            valid_loss
+        )
 
-        best_val_loss = valid_loss
+        best_val_accuracy = (
+            valid_accuracy
+        )
 
-        best_val_accuracy = valid_accuracy
-
-        best_epoch = epoch
-
-        patience_counter = 0
-
+        best_epoch = (
+            epoch + 1
+        )
 
         best_model_state = copy.deepcopy(
+
             model.state_dict()
         )
+
+        patience_counter = 0
 
 
         # ----------------------------------------------------
@@ -1059,13 +1799,39 @@ for epoch in range(
             {
 
                 "model_state_dict":
-                    best_model_state,
+                    model.state_dict(),
 
-                "classes":
-                    CLASSES,
+                "class_names":
+                    CLASS_NAMES,
+
+                "class_to_idx":
+                    train_dataset.class_to_idx,
+
+                "num_classes":
+                    NUM_CLASSES,
 
                 "image_size":
                     IMAGE_SIZE,
+
+                "model_name":
+                    "ResNet50",
+
+                "pretrained":
+                    pretrained_used,
+
+                "pretrained_source":
+                    "ImageNet"
+                    if pretrained_used
+                    else None,
+
+                "fine_tuning":
+                    "Layer4 + FC",
+
+                "train_target":
+                    TRAIN_TARGET,
+
+                "expected_train_total":
+                    EXPECTED_TRAIN_TOTAL,
 
                 "best_epoch":
                     best_epoch,
@@ -1076,8 +1842,22 @@ for epoch in range(
                 "best_val_accuracy":
                     best_val_accuracy,
 
-                "train_target":
-                    TRAIN_TARGET
+                "seed":
+                    SEED,
+
+                "augmentation":
+                    AUGMENTATION_CONFIG,
+
+                "normalization":
+                    {
+
+                        "mean":
+                            IMAGENET_MEAN,
+
+                        "std":
+                            IMAGENET_STD
+
+                    }
 
             },
 
@@ -1086,12 +1866,14 @@ for epoch in range(
 
 
         print(
-            "\n✓ Validation improved."
+            ">>> BEST MODEL SAVED"
         )
 
         print(
-            "✓ Best model saved."
+            best_model_path
         )
+
+        print()
 
 
     else:
@@ -1100,97 +1882,106 @@ for epoch in range(
 
 
         print(
-            f"\nNo significant improvement."
+            "No significant validation "
+            "loss improvement."
         )
 
         print(
+
             f"Early stopping counter: "
             f"{patience_counter}/{PATIENCE}"
         )
 
+        print()
 
-    # --------------------------------------------------------
-    # EARLY STOPPING
-    # --------------------------------------------------------
 
-    if patience_counter >= PATIENCE:
+        if (
 
-        print(
-            "\nEarly stopping triggered."
-        )
+            patience_counter
+            >= PATIENCE
 
-        break
+        ):
+
+            print("=" * 80)
+
+            print(
+                "EARLY STOPPING"
+            )
+
+            print("=" * 80)
+
+            print()
+
+            break
 
 
 # ============================================================
-# 29. TRAINING FINISHED
+# TRAINING FINISHED
 # ============================================================
 
 training_time = (
+
     time.time()
-    -
-    training_start
+    - training_start_time
 )
 
 
-print("\n")
-print("=" * 80)
-print("TRAINING COMPLETED")
-print("=" * 80)
+print()
 
+print("=" * 80)
 
 print(
-    f"Best epoch      : "
-    f"{best_epoch}"
+    "TRAINING COMPLETED"
+)
+
+print("=" * 80)
+
+print()
+
+print(
+
+    f"Training time: "
+    f"{training_time / 60:.2f} minutes"
+)
+
+print()
+
+print(
+    "Best epoch:",
+    best_epoch
 )
 
 print(
-    f"Best val loss   : "
+
+    "Best validation loss:",
+
     f"{best_val_loss:.4f}"
 )
 
 print(
-    f"Best val accuracy: "
-    f"{best_val_accuracy * 100:.2f}%"
+
+    "Best validation accuracy:",
+
+    f"{best_val_accuracy:.2f}%"
 )
 
-print(
-    f"Training time   : "
-    f"{training_time / 60:.2f} minutes"
-)
+print()
 
 
 # ============================================================
-# 30. SAFETY CHECK
+# RESTORE BEST MODEL
 # ============================================================
 
-if best_model_state is None:
+if best_model_state is not None:
 
-    raise RuntimeError(
-        "\nNo best model was saved.\n"
-        "Validation loss never improved."
+    model.load_state_dict(
+
+        best_model_state
     )
 
 
 # ============================================================
-# 31. RESTORE BEST MODEL
-# ============================================================
-
-print("\nRestoring best model...")
-
-model.load_state_dict(
-    best_model_state
-)
-
-model.eval()
-
-print(
-    f"Best epoch {best_epoch} restored."
-)
-
-
-# ============================================================
-# 32. SAVE FINAL MODEL
+# SAVE FINAL MODEL
 # ============================================================
 
 final_model_path = os.path.join(
@@ -1203,48 +1994,42 @@ final_model_path = os.path.join(
 
 torch.save(
 
-    model.state_dict(),
-
-    final_model_path
-)
-
-
-print(
-    f"\n✓ Final model saved:"
-)
-
-print(
-    final_model_path
-)
-
-
-# ============================================================
-# 33. SAVE MODEL CHECKPOINT
-# ============================================================
-
-checkpoint_path = os.path.join(
-
-    MODEL_DIR,
-
-    "condition_resnet50_checkpoint.pth"
-)
-
-
-torch.save(
-
     {
 
         "model_state_dict":
             model.state_dict(),
 
-        "classes":
-            CLASSES,
+        "class_names":
+            CLASS_NAMES,
+
+        "class_to_idx":
+            train_dataset.class_to_idx,
+
+        "num_classes":
+            NUM_CLASSES,
 
         "image_size":
             IMAGE_SIZE,
 
-        "num_classes":
-            NUM_CLASSES,
+        "model_name":
+            "ResNet50",
+
+        "pretrained":
+            pretrained_used,
+
+        "pretrained_source":
+            "ImageNet"
+            if pretrained_used
+            else None,
+
+        "fine_tuning":
+            "Layer4 + FC",
+
+        "train_target":
+            TRAIN_TARGET,
+
+        "expected_train_total":
+            EXPECTED_TRAIN_TOTAL,
 
         "best_epoch":
             best_epoch,
@@ -1255,51 +2040,102 @@ torch.save(
         "best_val_accuracy":
             best_val_accuracy,
 
-        "train_target":
-            TRAIN_TARGET,
+        "training_config":
+            {
 
-        "learning_rate":
-            LEARNING_RATE,
+                "batch_size":
+                    BATCH_SIZE,
 
-        "weight_decay":
-            WEIGHT_DECAY
+                "epochs":
+                    EPOCHS,
+
+                "learning_rate":
+                    LEARNING_RATE,
+
+                "weight_decay":
+                    WEIGHT_DECAY,
+
+                "dropout":
+                    DROPOUT,
+
+                "patience":
+                    PATIENCE,
+
+                "min_delta":
+                    MIN_DELTA,
+
+                "gradient_clip":
+                    GRADIENT_CLIP,
+
+                "seed":
+                    SEED,
+
+                "image_size":
+                    IMAGE_SIZE
+
+            },
+
+        "augmentation":
+            AUGMENTATION_CONFIG,
+
+        "normalization":
+            {
+
+                "mean":
+                    IMAGENET_MEAN,
+
+                "std":
+                    IMAGENET_STD
+
+            }
 
     },
 
-    checkpoint_path
+    final_model_path
 )
 
 
-print(
-    f"✓ Checkpoint saved:"
-)
+print("=" * 80)
 
 print(
-    checkpoint_path
+    "FINAL MODEL SAVED"
 )
+
+print("=" * 80)
+
+print()
+
+print(
+    final_model_path
+)
+
+print()
 
 
 # ============================================================
-# 34. FINAL TEST EVALUATION
+# FINAL TEST EVALUATION
 # ============================================================
 
-print("\n")
 print("=" * 80)
-print("FINAL TEST EVALUATION")
+
+print(
+    "FINAL INTERNAL TEST"
+)
+
 print("=" * 80)
+
+print()
 
 
 model.eval()
 
 
-all_true = []
-
 all_predictions = []
 
-all_probabilities = []
+all_labels = []
 
 
-test_running_loss = 0.0
+test_loss_total = 0.0
 
 test_total = 0
 
@@ -1309,170 +2145,128 @@ with torch.no_grad():
     for images, labels in test_loader:
 
         images = images.to(
-            DEVICE,
+
+            device,
+
             non_blocking=True
         )
 
         labels = labels.to(
-            DEVICE,
+
+            device,
+
             non_blocking=True
         )
 
 
-        if use_amp:
-
-            with torch.cuda.amp.autocast():
-
-                outputs = model(images)
-
-                loss = criterion(
-                    outputs,
-                    labels
-                )
-
-        else:
-
-            outputs = model(images)
-
-            loss = criterion(
-                outputs,
-                labels
-            )
+        outputs = model(
+            images
+        )
 
 
-        probabilities = torch.softmax(
+        loss = criterion(
+
             outputs,
-            dim=1
+
+            labels
         )
 
 
-        predictions = outputs.argmax(
-            dim=1
+        test_loss_total += (
+
+            loss.item()
+            * images.size(0)
         )
 
 
-        batch_size = images.size(0)
+        _, predictions = torch.max(
 
+            outputs,
 
-        test_running_loss += (
-            loss.item() * batch_size
-        )
-
-
-        test_total += batch_size
-
-
-        all_true.extend(
-            labels.cpu().numpy()
+            1
         )
 
 
         all_predictions.extend(
+
             predictions.cpu().numpy()
         )
 
 
-        all_probabilities.extend(
-            probabilities.cpu().numpy()
+        all_labels.extend(
+
+            labels.cpu().numpy()
+        )
+
+
+        test_total += (
+            labels.size(0)
         )
 
 
 # ============================================================
-# 35. TEST METRICS
+# TEST LOSS
 # ============================================================
 
 test_loss = (
-    test_running_loss
-    /
-    test_total
-)
 
-
-test_accuracy = accuracy_score(
-
-    all_true,
-
-    all_predictions
-)
-
-
-test_precision = precision_score(
-
-    all_true,
-
-    all_predictions,
-
-    average="weighted",
-
-    zero_division=0
-)
-
-
-test_recall = recall_score(
-
-    all_true,
-
-    all_predictions,
-
-    average="weighted",
-
-    zero_division=0
-)
-
-
-test_f1 = f1_score(
-
-    all_true,
-
-    all_predictions,
-
-    average="weighted",
-
-    zero_division=0
+    test_loss_total
+    / test_total
 )
 
 
 # ============================================================
-# 36. PRINT TEST RESULTS
+# TEST ACCURACY
+# ============================================================
+
+test_accuracy = (
+
+    accuracy_score(
+
+        all_labels,
+
+        all_predictions
+
+    )
+
+    * 100
+)
+
+
+# ============================================================
+# PRINT TEST RESULTS
 # ============================================================
 
 print(
-    f"\nTest Loss      : "
+
+    "Test Loss:",
+
     f"{test_loss:.4f}"
 )
 
-print(
-    f"Test Accuracy  : "
-    f"{test_accuracy * 100:.2f}%"
-)
+print()
 
 print(
-    f"Test Precision : "
-    f"{test_precision * 100:.2f}%"
+
+    "Test Accuracy:",
+
+    f"{test_accuracy:.2f}%"
 )
 
-print(
-    f"Test Recall    : "
-    f"{test_recall * 100:.2f}%"
-)
-
-print(
-    f"Test F1 Score  : "
-    f"{test_f1 * 100:.2f}%"
-)
+print()
 
 
 # ============================================================
-# 37. CLASSIFICATION REPORT
+# CLASSIFICATION REPORT
 # ============================================================
 
 report = classification_report(
 
-    all_true,
+    all_labels,
 
     all_predictions,
 
-    target_names=CLASSES,
+    target_names=CLASS_NAMES,
 
     digits=4,
 
@@ -1480,16 +2274,23 @@ report = classification_report(
 )
 
 
-print("\n")
-print("=" * 80)
-print("CLASSIFICATION REPORT")
 print("=" * 80)
 
-print(report)
+print(
+    "CLASSIFICATION REPORT"
+)
+
+print("=" * 80)
+
+print()
+
+print(
+    report
+)
 
 
 # ============================================================
-# 38. SAVE CLASSIFICATION REPORT
+# SAVE CLASSIFICATION REPORT
 # ============================================================
 
 report_path = os.path.join(
@@ -1501,19 +2302,36 @@ report_path = os.path.join(
 
 
 with open(
+
     report_path,
+
     "w",
+
     encoding="utf-8"
+
 ) as file:
 
     file.write(
-        "CAPSICUM RESNET50 - CLASSIFICATION REPORT\n"
+
+        "CAPSICUM RESNET50 - FINAL INTERNAL TEST\n"
     )
 
     file.write(
+
         "=" * 80
-        +
-        "\n\n"
+        + "\n\n"
+    )
+
+    file.write(
+
+        f"Test Loss: "
+        f"{test_loss:.4f}\n"
+    )
+
+    file.write(
+
+        f"Test Accuracy: "
+        f"{test_accuracy:.2f}%\n\n"
     )
 
     file.write(
@@ -1522,12 +2340,12 @@ with open(
 
 
 # ============================================================
-# 39. CONFUSION MATRIX
+# CONFUSION MATRIX
 # ============================================================
 
 cm = confusion_matrix(
 
-    all_true,
+    all_labels,
 
     all_predictions,
 
@@ -1537,18 +2355,58 @@ cm = confusion_matrix(
 )
 
 
+# ============================================================
+# SAVE CONFUSION MATRIX JSON
+# ============================================================
+
+cm_path = os.path.join(
+
+    RESULT_DIR,
+
+    "confusion_matrix.json"
+)
+
+
+with open(
+
+    cm_path,
+
+    "w",
+
+    encoding="utf-8"
+
+) as file:
+
+    json.dump(
+
+        cm.tolist(),
+
+        file,
+
+        indent=4
+    )
+
+
+# ============================================================
+# CONFUSION MATRIX PLOT
+# ============================================================
+
 plt.figure(
+
     figsize=(14, 12)
 )
 
 
 plt.imshow(
+
     cm,
+
     interpolation="nearest"
 )
 
 
 plt.title(
+
     "Capsicum ResNet50 - Confusion Matrix"
 )
 
@@ -1557,20 +2415,71 @@ plt.colorbar()
 
 
 tick_marks = np.arange(
+
     NUM_CLASSES
 )
 
 
 plt.xticks(
+
     tick_marks,
-    CLASSES,
+
+    CLASS_NAMES,
+
     rotation=90
 )
 
 
 plt.yticks(
+
     tick_marks,
-    CLASSES
+
+    CLASS_NAMES
+)
+
+
+threshold = (
+
+    cm.max()
+    / 2.0
+)
+
+
+for i in range(
+    cm.shape[0]
+):
+
+    for j in range(
+        cm.shape[1]
+    ):
+
+        plt.text(
+
+            j,
+
+            i,
+
+            str(
+                cm[i, j]
+            ),
+
+            horizontalalignment="center",
+
+            verticalalignment="center",
+
+            color=(
+
+                "white"
+
+                if cm[i, j] > threshold
+
+                else "black"
+            )
+        )
+
+
+plt.ylabel(
+    "True Label"
 )
 
 
@@ -1579,30 +2488,10 @@ plt.xlabel(
 )
 
 
-plt.ylabel(
-    "True Label"
-)
-
-
-# Add values inside cells.
-
-for i in range(NUM_CLASSES):
-
-    for j in range(NUM_CLASSES):
-
-        plt.text(
-            j,
-            i,
-            str(cm[i, j]),
-            ha="center",
-            va="center"
-        )
-
-
 plt.tight_layout()
 
 
-cm_path = os.path.join(
+confusion_plot_path = os.path.join(
 
     RESULT_DIR,
 
@@ -1611,8 +2500,11 @@ cm_path = os.path.join(
 
 
 plt.savefig(
-    cm_path,
-    dpi=200,
+
+    confusion_plot_path,
+
+    dpi=300,
+
     bbox_inches="tight"
 )
 
@@ -1620,20 +2512,11 @@ plt.savefig(
 plt.close()
 
 
-print(
-    f"\n✓ Confusion matrix saved:"
-)
-
-print(
-    cm_path
-)
-
-
 # ============================================================
-# 40. TRAINING LOSS GRAPH
+# LOSS GRAPH
 # ============================================================
 
-epochs_completed = range(
+epochs_range = range(
 
     1,
 
@@ -1644,13 +2527,14 @@ epochs_completed = range(
 
 
 plt.figure(
+
     figsize=(10, 6)
 )
 
 
 plt.plot(
 
-    epochs_completed,
+    epochs_range,
 
     history["train_loss"],
 
@@ -1660,7 +2544,7 @@ plt.plot(
 
 plt.plot(
 
-    epochs_completed,
+    epochs_range,
 
     history["valid_loss"],
 
@@ -1679,7 +2563,8 @@ plt.ylabel(
 
 
 plt.title(
-    "Training vs Validation Loss"
+
+    "ResNet50 Training and Validation Loss"
 )
 
 
@@ -1687,11 +2572,17 @@ plt.legend()
 
 
 plt.grid(
-    True
+
+    True,
+
+    alpha=0.3
 )
 
 
-loss_graph_path = os.path.join(
+plt.tight_layout()
+
+
+loss_plot_path = os.path.join(
 
     RESULT_DIR,
 
@@ -1701,9 +2592,9 @@ loss_graph_path = os.path.join(
 
 plt.savefig(
 
-    loss_graph_path,
+    loss_plot_path,
 
-    dpi=200,
+    dpi=300,
 
     bbox_inches="tight"
 )
@@ -1713,21 +2604,20 @@ plt.close()
 
 
 # ============================================================
-# 41. ACCURACY GRAPH
+# ACCURACY GRAPH
 # ============================================================
 
 plt.figure(
+
     figsize=(10, 6)
 )
 
 
 plt.plot(
 
-    epochs_completed,
+    epochs_range,
 
-    np.array(
-        history["train_accuracy"]
-    ) * 100,
+    history["train_accuracy"],
 
     label="Train Accuracy"
 )
@@ -1735,11 +2625,9 @@ plt.plot(
 
 plt.plot(
 
-    epochs_completed,
+    epochs_range,
 
-    np.array(
-        history["valid_accuracy"]
-    ) * 100,
+    history["valid_accuracy"],
 
     label="Validation Accuracy"
 )
@@ -1756,7 +2644,8 @@ plt.ylabel(
 
 
 plt.title(
-    "Training vs Validation Accuracy"
+
+    "ResNet50 Training and Validation Accuracy"
 )
 
 
@@ -1764,11 +2653,17 @@ plt.legend()
 
 
 plt.grid(
-    True
+
+    True,
+
+    alpha=0.3
 )
 
 
-accuracy_graph_path = os.path.join(
+plt.tight_layout()
+
+
+accuracy_plot_path = os.path.join(
 
     RESULT_DIR,
 
@@ -1778,9 +2673,9 @@ accuracy_graph_path = os.path.join(
 
 plt.savefig(
 
-    accuracy_graph_path,
+    accuracy_plot_path,
 
-    dpi=200,
+    dpi=300,
 
     bbox_inches="tight"
 )
@@ -1790,7 +2685,7 @@ plt.close()
 
 
 # ============================================================
-# 42. SAVE HISTORY JSON
+# SAVE HISTORY
 # ============================================================
 
 history_path = os.path.join(
@@ -1822,19 +2717,120 @@ with open(
 
 
 # ============================================================
-# 43. SAVE TRAINING SUMMARY
+# SAVE DATASET COUNTS
 # ============================================================
 
-summary = {
+dataset_counts = {
+
+    "classes":
+        CLASS_NAMES,
+
+    "num_classes":
+        NUM_CLASSES,
+
+    "train_target_per_class":
+        TRAIN_TARGET,
+
+    "expected_train_total":
+        EXPECTED_TRAIN_TOTAL,
+
+    "train_total":
+        len(train_dataset),
+
+    "valid_total":
+        len(valid_dataset),
+
+    "test_total":
+        len(test_dataset),
+
+    "train":
+        train_counts,
+
+    "valid":
+        valid_counts,
+
+    "test":
+        test_counts
+
+}
+
+
+dataset_counts_path = os.path.join(
+
+    RESULT_DIR,
+
+    "dataset_counts.json"
+)
+
+
+with open(
+
+    dataset_counts_path,
+
+    "w",
+
+    encoding="utf-8"
+
+) as file:
+
+    json.dump(
+
+        dataset_counts,
+
+        file,
+
+        indent=4
+    )
+
+
+# ============================================================
+# TRAINING SUMMARY
+# ============================================================
+
+training_summary = {
+
+    "project":
+        "Capsicum Plant Condition Classification",
 
     "model":
         "ResNet50",
 
-    "classes":
-        CLASSES,
+    "pretrained":
+        pretrained_used,
+
+    "pretrained_source":
+        "ImageNet"
+        if pretrained_used
+        else None,
+
+    "fine_tuning":
+        {
+
+            "layer1":
+                "Frozen",
+
+            "layer2":
+                "Frozen",
+
+            "layer3":
+                "Frozen",
+
+            "layer4":
+                "Trainable",
+
+            "fc":
+                "Trainable"
+
+        },
+
+    "fc_architecture":
+        "Dropout(0.30) + Linear(2048 -> 13)",
 
     "num_classes":
         NUM_CLASSES,
+
+    "class_names":
+        CLASS_NAMES,
 
     "image_size":
         IMAGE_SIZE,
@@ -1850,9 +2846,6 @@ summary = {
             history["train_loss"]
         ),
 
-    "best_epoch":
-        best_epoch,
-
     "learning_rate":
         LEARNING_RATE,
 
@@ -1862,17 +2855,23 @@ summary = {
     "dropout":
         DROPOUT,
 
+    "gradient_clip":
+        GRADIENT_CLIP,
+
     "train_target_per_class":
         TRAIN_TARGET,
 
     "train_total":
-        total_train,
+        len(train_dataset),
 
     "validation_total":
-        total_valid,
+        len(valid_dataset),
 
     "test_total":
-        total_test,
+        len(test_dataset),
+
+    "best_epoch":
+        best_epoch,
 
     "best_validation_loss":
         best_val_loss,
@@ -1886,32 +2885,22 @@ summary = {
     "test_accuracy":
         test_accuracy,
 
-    "test_precision_weighted":
-        test_precision,
+    "training_time_minutes":
+        training_time / 60,
 
-    "test_recall_weighted":
-        test_recall,
+    "augmentation":
+        AUGMENTATION_CONFIG,
 
-    "test_f1_weighted":
-        test_f1,
+    "normalization":
+        {
 
-    "device":
-        str(DEVICE),
+            "mean":
+                IMAGENET_MEAN,
 
-    "trainable_parameters":
-        trainable_parameters,
+            "std":
+                IMAGENET_STD
 
-    "total_parameters":
-        total_parameters,
-
-    "offline_augmentation":
-        True,
-
-    "validation_augmentation":
-        False,
-
-    "test_augmentation":
-        False
+        }
 
 }
 
@@ -1936,7 +2925,7 @@ with open(
 
     json.dump(
 
-        summary,
+        training_summary,
 
         file,
 
@@ -1945,82 +2934,275 @@ with open(
 
 
 # ============================================================
-# 44. FINAL OUTPUT
+# SAVE CHECKPOINT
 # ============================================================
 
-print("\n")
-print("=" * 80)
-print("TRAINING PIPELINE FINISHED")
-print("=" * 80)
+checkpoint_path = os.path.join(
 
-print("\nModel:")
-print(
-    f"  {final_model_path}"
+    MODEL_DIR,
+
+    "condition_resnet50_checkpoint.pth"
 )
 
-print("\nBest model:")
+
+torch.save(
+
+    {
+
+        "epoch":
+            len(
+                history["train_loss"]
+            ),
+
+        "model_state_dict":
+            model.state_dict(),
+
+        "optimizer_state_dict":
+            optimizer.state_dict(),
+
+        "scheduler_state_dict":
+            scheduler.state_dict(),
+
+        "class_names":
+            CLASS_NAMES,
+
+        "class_to_idx":
+            train_dataset.class_to_idx,
+
+        "num_classes":
+            NUM_CLASSES,
+
+        "image_size":
+            IMAGE_SIZE,
+
+        "pretrained":
+            pretrained_used,
+
+        "pretrained_source":
+            "ImageNet"
+            if pretrained_used
+            else None,
+
+        "fine_tuning":
+            "Layer4 + FC",
+
+        "best_epoch":
+            best_epoch,
+
+        "best_val_loss":
+            best_val_loss,
+
+        "best_val_accuracy":
+            best_val_accuracy,
+
+        "augmentation":
+            AUGMENTATION_CONFIG,
+
+        "history":
+            history
+
+    },
+
+    checkpoint_path
+)
+
+
+# ============================================================
+# FINAL OUTPUT
+# ============================================================
+
+print()
+
+print("=" * 80)
+
 print(
+    "ALL TRAINING OUTPUTS SAVED"
+)
+
+print("=" * 80)
+
+print()
+
+print(
+    "MODEL FILES:"
+)
+
+print(
+
+    "1.",
+
     os.path.join(
+
         MODEL_DIR,
+
         "condition_resnet50_best.pth"
     )
 )
 
-print("\nClassification report:")
 print(
+
+    "2.",
+
+    final_model_path
+)
+
+print(
+
+    "3.",
+
+    checkpoint_path
+)
+
+print()
+
+print(
+    "RESULT FILES:"
+)
+
+print(
+    "1.",
     report_path
 )
 
-print("\nConfusion matrix:")
 print(
+    "2.",
     cm_path
 )
 
-print("\nLoss curve:")
 print(
-    loss_graph_path
+    "3.",
+    confusion_plot_path
 )
 
-print("\nAccuracy curve:")
 print(
-    accuracy_graph_path
+    "4.",
+    loss_plot_path
 )
 
-print("\nTraining history:")
 print(
+    "5.",
+    accuracy_plot_path
+)
+
+print(
+    "6.",
     history_path
 )
 
-print("\nTraining summary:")
 print(
+    "7.",
+    dataset_counts_path
+)
+
+print(
+    "8.",
     summary_path
 )
 
-print("\n")
+print()
+
 print("=" * 80)
-print("FINAL TEST RESULT")
-print("=" * 80)
 
 print(
-    f"Accuracy : "
-    f"{test_accuracy * 100:.2f}%"
-)
-
-print(
-    f"Precision: "
-    f"{test_precision * 100:.2f}%"
-)
-
-print(
-    f"Recall   : "
-    f"{test_recall * 100:.2f}%"
-)
-
-print(
-    f"F1 Score : "
-    f"{test_f1 * 100:.2f}%"
+    "FINAL RESULTS"
 )
 
 print("=" * 80)
 
-print("\nDONE.")
+print()
+
+print(
+
+    f"Best Validation Accuracy : "
+    f"{best_val_accuracy:.2f}%"
+)
+
+print(
+
+    f"Final Test Accuracy      : "
+    f"{test_accuracy:.2f}%"
+)
+
+print(
+
+    f"Final Test Loss          : "
+    f"{test_loss:.4f}"
+)
+
+print()
+
+print(
+    "Training configuration:"
+)
+
+print(
+
+    "ResNet50 ImageNet Pretrained"
+    if pretrained_used
+    else
+    "ResNet50 without pretrained weights"
+)
+
+print(
+    "Layer1: Frozen"
+)
+
+print(
+    "Layer2: Frozen"
+)
+
+print(
+    "Layer3: Frozen"
+)
+
+print(
+    "Layer4: Trainable"
+)
+
+print(
+    "FC: Trainable"
+)
+
+print(
+    "FC: Dropout(0.30) + Linear(2048 -> 13)"
+)
+
+print(
+    "Gradient clipping:",
+    GRADIENT_CLIP
+)
+
+print()
+
+print(
+    "Offline augmentation:"
+)
+
+print(
+    "Strong / Moderate-Strong / Moderate / "
+    "Light / Very-Light / None"
+)
+
+print(
+    "Train target:",
+    TRAIN_TARGET,
+    "images/class"
+)
+
+print(
+    "Total training images:",
+    EXPECTED_TRAIN_TOTAL
+)
+
+print()
+
+print("=" * 80)
+
+print(
+    "CAPSICUM RESNET50 TRAINING FINISHED"
+)
+
+print("=" * 80)
+
+print()
+
