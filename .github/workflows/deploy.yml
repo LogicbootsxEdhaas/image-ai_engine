@@ -34,16 +34,14 @@ jobs:
       - name: Fetch Git LFS artifacts
         run: |
           git lfs pull
-
-      # Step 3: Authenticate to GCP using Workload Identity Federation via GitHub Secrets
-            # Step 3: Authenticate to GCP using Workload Identity Federation
+       # Step 3: Authenticate to GCP using Workload Identity Federation via GitHub Secrets
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
-
+          token_format: access_token
       # Step 4: Set up Google Cloud SDK
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
